@@ -1,0 +1,1 @@
+namespace SqDbAiAgent.ConsoleApp.Models;
