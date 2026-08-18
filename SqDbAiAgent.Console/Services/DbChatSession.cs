@@ -137,6 +137,7 @@ public sealed class DbChatSession(
     {
         var messages = this.BuildNativeMessages(userRequest, includeHistory);
         var historyInput = userRequest;
+        var submitSqlRequired = false;
 
         for (var stepIndex = 1; stepIndex <= appConfig.MaxAgentSteps; stepIndex++)
         {
@@ -169,6 +170,29 @@ public sealed class DbChatSession(
                     continue;
                 }
 
+                if (submitSqlRequired)
+                {
+                    output.OutDebugLine("Model returned assistant text after being required to call submit_sql.");
+                    output.OutDebugLine(string.Empty);
+                    messages.Add(new ChatMessage("assistant", result.Content));
+                    messages.Add(new ChatMessage(
+                        "user",
+                        "This response is still invalid. You already attempted to answer with SQL, so you must call submit_sql now. Do not answer from memory and do not return assistant text."));
+                    continue;
+                }
+
+                if (NativeAgentResponsePolicy.RejectSqlAssistantText(result.Content))
+                {
+                    output.OutDebugLine("Model returned SQL in assistant text instead of calling submit_sql.");
+                    output.OutDebugLine(string.Empty);
+                    submitSqlRequired = true;
+                    messages.Add(new ChatMessage("assistant", result.Content));
+                    messages.Add(new ChatMessage(
+                        "user",
+                        "Your previous response was invalid because it returned SQL as assistant text. Never show proposed SQL to the user. Call submit_sql now with that SQL and do not return assistant text."));
+                    continue;
+                }
+
                 var action = new AgentAction(AgentActionType.Respond, result.Content.Trim(), string.Empty);
                 this.AppendAgentTurn(historyInput, action);
                 this.WriteRespond(action);
@@ -190,6 +214,12 @@ public sealed class DbChatSession(
             }
 
             var call = result.ToolCalls[0];
+            if (submitSqlRequired && !string.Equals(call.Name, "submit_sql", StringComparison.Ordinal))
+            {
+                messages.Add(BuildToolMessage(call, "Rejected: submit_sql is required to correct the previous SQL assistant response."));
+                continue;
+            }
+
             switch (call.Name)
             {
                 case "describe_database":
@@ -222,6 +252,7 @@ public sealed class DbChatSession(
                         continue;
                     }
 
+                    submitSqlRequired = false;
                     var sqlAction = new AgentAction(AgentActionType.RunSql, string.Empty, sql);
                     this.AppendAgentTurn(historyInput, sqlAction);
                     var approvalResult = await sqlApprovalSession.ApproveAsync(
@@ -832,6 +863,8 @@ public sealed class DbChatSession(
           - Briefly redirect unrelated requests back to database topics.
           - Use only the schema below and never invent tables, columns, relationships, or business filters.
           - SQL must be self-contained, read-only SQL Server T-SQL with exact schema-qualified names.
+          - Never return proposed SQL as assistant text, Markdown, or a fenced code block.
+          - SQL intended to answer a data request must appear only in the sql argument of a submit_sql tool call.
           - Never use LIMIT, RETURNING, markdown fences, comments, placeholders, variables, or parameters in SQL.
           - Prefer simple SELECT, JOIN, WHERE, GROUP BY, and ORDER BY constructs.
           - Never render or reconstruct a table in assistant text. The application renders tables; summarize visible results only.
