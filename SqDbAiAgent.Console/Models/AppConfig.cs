@@ -42,6 +42,10 @@ public sealed class AppConfig
     // Overall reasoning mode for model calls: Auto uses retry-based escalation, Enabled always enables reasoning, Disabled never enables it.
     public LlmReasoningMode Reasoning { get; init; } = LlmReasoningMode.Auto;
 
+    public ToolCallingMode ToolCalling { get; init; } = ToolCallingMode.Auto;
+
+    public ToolScope ToolScope { get; init; } = ToolScope.Full;
+
     // Maximum number of attempts to get a valid SQL-fix JSON response for one repair step.
     [Range(1, 100)]
     public int MaxFixResponseAttempts { get; init; } = 3;

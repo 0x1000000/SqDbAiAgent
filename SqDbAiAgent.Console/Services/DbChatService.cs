@@ -20,6 +20,7 @@ public sealed class DbChatService(
     IOptions<AppConfig> appConfig,
     IOptions<OllamaOptions> ollamaOptions,
     IOptions<OpenRouterOptions> openRouterOptions,
+    ToolCallingResolver toolCallingResolver,
     ISecurityFilterFactoryService securityFilterFactoryService)
     : IChatService
 {
@@ -95,6 +96,7 @@ public sealed class DbChatService(
 
         var messageAnalyzeSession = messageAnalyzeService.CreateSession(output, databaseName, tables, analyzerSchemaPrompt);
         var sqlApprovalSession = sqlApprovalService.CreateSession(output, databaseName, tables, schemaPrompt);
+        var toolCalling = await toolCallingResolver.ResolveAsync(appConfig.ToolCalling, model, cancellationToken);
 
         return new DbChatSession(
             output,
@@ -110,6 +112,7 @@ public sealed class DbChatService(
             llmName: model,
             connectionString: connectionString,
             databaseName: databaseName,
+            useNativeTools: toolCalling.UseNativeTools,
             dbFactory: GetDb
         );
     }

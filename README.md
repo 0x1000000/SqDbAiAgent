@@ -128,6 +128,10 @@ The main configuration areas are:
     Always request reasoning.
   - `Disabled`
     Never request reasoning.
+- `ToolCalling`
+  Native tool-calling behavior. `Auto` uses provider model metadata and falls back to the existing structured JSON action protocol, `Enabled` requires tool support, and `Disabled` always uses structured JSON actions.
+- `ToolScope`
+  Set to `Minimal` to expose only `submit_sql`, or `Full` to also expose `describe_database`, `clarify_request`, and `finish_conversation`.
 - `MaxFixResponseAttempts`
   Maximum number of attempts to get one valid SQL-fix JSON response for a single repair step.
 - `MaxUnchangedSqlResponses`

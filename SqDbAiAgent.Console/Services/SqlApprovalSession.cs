@@ -216,12 +216,13 @@ public sealed class SqlApprovalSession : ISqlApprovalSession
     {
         try
         {
-            return await this._llmClient.ChatAsync(
+            var result = await this._llmClient.ChatAsync(
                 this._llmName,
                 messages,
                 LlmResponse.JsonSchema,
                 thinkLevel: this.GetRetryThinkLevel(attempt),
                 cancellationToken: cancellationToken);
+            return result.Content;
         }
         catch (Exception ex)
         {

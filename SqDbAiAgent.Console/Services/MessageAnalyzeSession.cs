@@ -139,12 +139,13 @@ public sealed class MessageAnalyzeSession : IMessageAnalyzeSession
 
         try
         {
-            return await this._llmClient.ChatAsync(
+            var result = await this._llmClient.ChatAsync(
                 this._llmName,
                 messages,
                 format,
                 thinkLevel: this.GetRetryThinkLevel(attempt),
                 cancellationToken: cancellationToken);
+            return result.Content;
         }
         catch (Exception ex)
         {

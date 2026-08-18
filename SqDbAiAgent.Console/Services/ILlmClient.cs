@@ -7,10 +7,15 @@ public interface ILlmClient
 {
     Task<IReadOnlyList<string>> GetAvailableModelsAsync(CancellationToken cancellationToken = default);
 
-    Task<string> ChatAsync(
+    Task<LlmModelCapabilities> GetModelCapabilitiesAsync(
+        string model,
+        CancellationToken cancellationToken = default);
+
+    Task<LlmChatResult> ChatAsync(
         string model,
         IReadOnlyList<ChatMessage> messages,
         JsonElement? format = null,
         LlmThinkLevel thinkLevel = LlmThinkLevel.Default,
+        IReadOnlyList<LlmToolDefinition>? tools = null,
         CancellationToken cancellationToken = default);
 }

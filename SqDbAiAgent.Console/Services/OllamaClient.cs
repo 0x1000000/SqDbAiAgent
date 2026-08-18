@@ -7,6 +7,17 @@ namespace SqDbAiAgent.ConsoleApp.Services;
 
 public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger interactionLogger) : ILlmClient
 {
+    public async Task<LlmModelCapabilities> GetModelCapabilitiesAsync(
+        string model,
+        CancellationToken cancellationToken = default)
+    {
+        using var response = await httpClient.PostAsJsonAsync("/api/show", new { model }, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        var payload = await response.Content.ReadFromJsonAsync<OllamaShowResponse>(cancellationToken: cancellationToken);
+        return new LlmModelCapabilities(
+            payload?.Capabilities?.Contains("tools", StringComparer.OrdinalIgnoreCase) == true);
+    }
+
     public async Task<IReadOnlyList<string>> GetAvailableModelsAsync(CancellationToken cancellationToken = default)
     {
         using var response = await httpClient.GetAsync("/api/tags", cancellationToken);
@@ -26,11 +37,12 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
             .ToArray();
     }
 
-    public async Task<string> ChatAsync(
+    public async Task<LlmChatResult> ChatAsync(
         string model,
         IReadOnlyList<ChatMessage> messages,
         JsonElement? format = null,
         LlmThinkLevel thinkLevel = LlmThinkLevel.Default,
+        IReadOnlyList<LlmToolDefinition>? tools = null,
         CancellationToken cancellationToken = default)
     {
         var request = new OllamaChatRequest
@@ -47,9 +59,13 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
                 .Select(message => new OllamaChatMessageDto
                 {
                     Role = message.Role,
-                    Content = message.Content
+                    Content = message.Content,
+                    ToolCallId = message.ToolCallId,
+                    ToolName = message.Name,
+                    ToolCalls = message.ToolCalls?.Select(ToToolCallDto).ToList()
                 })
-                .ToList()
+                .ToList(),
+            Tools = tools?.Select(ToToolDto).ToList()
         };
         if (interactionLogger.IsEnabled)
         {
@@ -78,14 +94,43 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
         }
 
         var payload = JsonSerializer.Deserialize<OllamaChatResponse>(responseJson, JsonSerializerOptions);
-        var content = payload?.Message?.Content;
+        var content = payload?.Message?.Content ?? string.Empty;
+        var toolCalls = payload?.Message?.ToolCalls?
+            .Select((call, index) => new LlmToolCall(
+                string.IsNullOrWhiteSpace(call.Id) ? $"call_{index + 1}_{Guid.NewGuid():N}" : call.Id,
+                call.Function?.Name ?? string.Empty,
+                call.Function?.Arguments ?? EmptyObject))
+            .ToArray() ?? [];
 
-        if (string.IsNullOrWhiteSpace(content))
+        if (string.IsNullOrWhiteSpace(content) && toolCalls.Length == 0)
         {
             throw new InvalidOperationException("Ollama returned an empty chat response.");
         }
 
-        return content;
+        return new LlmChatResult(content, toolCalls);
+    }
+
+    private static OllamaToolDto ToToolDto(LlmToolDefinition tool) => new()
+    {
+        Type = "function",
+        Function = new OllamaFunctionDto
+        {
+            Name = tool.Name,
+            Description = tool.Description,
+            Parameters = tool.Parameters
+        }
+    };
+
+    private static OllamaToolCallDto ToToolCallDto(LlmToolCall call) => new()
+    {
+        Id = call.Id,
+        Function = new OllamaFunctionCallDto { Name = call.Name, Arguments = call.Arguments }
+    };
+
+    private sealed class OllamaShowResponse
+    {
+        [JsonPropertyName("capabilities")]
+        public List<string>? Capabilities { get; init; }
     }
 
     private sealed class OllamaTagsResponse
@@ -120,6 +165,10 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
 
         [JsonPropertyName("messages")]
         public List<OllamaChatMessageDto> Messages { get; init; } = [];
+
+        [JsonPropertyName("tools")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public List<OllamaToolDto>? Tools { get; init; }
     }
 
     private sealed class OllamaChatOptions
@@ -141,6 +190,58 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
 
         [JsonPropertyName("content")]
         public string Content { get; init; } = string.Empty;
+
+        [JsonPropertyName("tool_calls")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public List<OllamaToolCallDto>? ToolCalls { get; init; }
+
+        [JsonPropertyName("tool_call_id")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? ToolCallId { get; init; }
+
+        [JsonPropertyName("tool_name")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? ToolName { get; init; }
+    }
+
+    private sealed class OllamaToolDto
+    {
+        [JsonPropertyName("type")]
+        public string Type { get; init; } = "function";
+
+        [JsonPropertyName("function")]
+        public OllamaFunctionDto Function { get; init; } = new();
+    }
+
+    private sealed class OllamaFunctionDto
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        [JsonPropertyName("description")]
+        public string Description { get; init; } = string.Empty;
+
+        [JsonPropertyName("parameters")]
+        public JsonElement Parameters { get; init; }
+    }
+
+    private sealed class OllamaToolCallDto
+    {
+        [JsonPropertyName("id")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public string? Id { get; init; }
+
+        [JsonPropertyName("function")]
+        public OllamaFunctionCallDto? Function { get; init; }
+    }
+
+    private sealed class OllamaFunctionCallDto
+    {
+        [JsonPropertyName("name")]
+        public string Name { get; init; } = string.Empty;
+
+        [JsonPropertyName("arguments")]
+        public JsonElement Arguments { get; init; }
     }
 
     private static readonly JsonSerializerOptions JsonSerializerOptions = new()
@@ -148,6 +249,8 @@ public sealed class OllamaClient(HttpClient httpClient, ILlmInteractionLogger in
         PropertyNamingPolicy = null,
         WriteIndented = true
     };
+
+    private static readonly JsonElement EmptyObject = JsonDocument.Parse("{}").RootElement.Clone();
 
     private static object? ToWireThinkValue(LlmThinkLevel thinkLevel)
     {

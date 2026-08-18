@@ -1,6 +1,7 @@
 using System.Data;
 using System.Diagnostics.CodeAnalysis;
 using System.Text;
+using System.Text.Json;
 using Microsoft.Data.SqlClient;
 using SqDbAiAgent.ConsoleApp.Conversation;
 using SqDbAiAgent.ConsoleApp.Models;
@@ -24,9 +25,14 @@ public sealed class DbChatSession(
     string llmName,
     string connectionString,
     string databaseName,
+    bool useNativeTools,
     Func<string, ISqDatabase> dbFactory)
 {
-    private readonly string _agentSystemPrompt = BuildAgentSystemPrompt(databaseName, schemaPrompt);
+    private readonly string _agentSystemPrompt = useNativeTools
+        ? BuildNativeAgentSystemPrompt(databaseName, schemaPrompt)
+        : BuildAgentSystemPrompt(databaseName, schemaPrompt);
+
+    private readonly IReadOnlyList<LlmToolDefinition> _tools = BuildToolDefinitions(appConfig.ToolScope);
 
     private readonly ChatHistoryManager<AgentAction> _agentHistory = new(
         appConfig.MaxPromptChars,
@@ -48,6 +54,14 @@ public sealed class DbChatSession(
         {
             this.WriteAgentActionFailure();
             return true;
+        }
+
+        if (useNativeTools)
+        {
+            return await this.HandleInputWithNativeToolsAsync(
+                userRequest.Trim(),
+                !messageAnalysis.Value.IsNewTopic,
+                cancellationToken);
         }
 
         for (var stepIndex = 1; stepIndex <= appConfig.MaxAgentSteps; stepIndex++)
@@ -113,6 +127,179 @@ public sealed class DbChatSession(
 
         this.WriteAgentStepLimitReached();
 
+        return true;
+    }
+
+    private async Task<bool> HandleInputWithNativeToolsAsync(
+        string userRequest,
+        bool includeHistory,
+        CancellationToken cancellationToken)
+    {
+        var messages = this.BuildNativeMessages(userRequest, includeHistory);
+        var historyInput = userRequest;
+
+        for (var stepIndex = 1; stepIndex <= appConfig.MaxAgentSteps; stepIndex++)
+        {
+            LlmChatResult result;
+            try
+            {
+                result = await ollamaClient.ChatAsync(
+                    llmName,
+                    messages,
+                    thinkLevel: this.GetRetryThinkLevel(stepIndex),
+                    tools: this._tools,
+                    cancellationToken: cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                this.WriteModelCallFailure("native agent step", stepIndex, ex);
+                if (!LlmRetryPolicy.ShouldRetry(ex))
+                {
+                    throw;
+                }
+
+                continue;
+            }
+
+            if (result.ToolCalls.Count == 0)
+            {
+                if (string.IsNullOrWhiteSpace(result.Content))
+                {
+                    messages.Add(new ChatMessage("user", "Return a plain-text answer or call exactly one available tool."));
+                    continue;
+                }
+
+                var action = new AgentAction(AgentActionType.Respond, result.Content.Trim(), string.Empty);
+                this.AppendAgentTurn(historyInput, action);
+                this.WriteRespond(action);
+                return true;
+            }
+
+            messages.Add(new ChatMessage("assistant", result.Content, result.ToolCalls));
+
+            if (result.ToolCalls.Count != 1)
+            {
+                foreach (var conflictingCall in result.ToolCalls)
+                {
+                    messages.Add(BuildToolMessage(
+                        conflictingCall,
+                        "Rejected: call exactly one tool at a time."));
+                }
+
+                continue;
+            }
+
+            var call = result.ToolCalls[0];
+            switch (call.Name)
+            {
+                case "describe_database":
+                    messages.Add(BuildToolMessage(call, schemaPrompt));
+                    continue;
+
+                case "clarify_request":
+                    if (!TryGetStringArgument(call.Arguments, "question", out var question))
+                    {
+                        messages.Add(BuildToolMessage(call, "Rejected: question must be a non-empty string."));
+                        continue;
+                    }
+
+                    var clarification = new AgentAction(AgentActionType.Respond, question, string.Empty);
+                    this.AppendAgentTurn(userRequest, clarification);
+                    this.WriteRespond(clarification);
+                    return true;
+
+                case "finish_conversation":
+                    TryGetStringArgument(call.Arguments, "message", out var goodbye);
+                    var exitAction = new AgentAction(AgentActionType.Exit, goodbye, string.Empty);
+                    this.AppendAgentTurn(userRequest, exitAction);
+                    this.WriteExit(exitAction);
+                    return false;
+
+                case "submit_sql":
+                    if (!TryGetStringArgument(call.Arguments, "sql", out var sql))
+                    {
+                        messages.Add(BuildToolMessage(call, "Rejected: sql must be a non-empty string."));
+                        continue;
+                    }
+
+                    var sqlAction = new AgentAction(AgentActionType.RunSql, string.Empty, sql);
+                    this.AppendAgentTurn(historyInput, sqlAction);
+                    var approvalResult = await sqlApprovalSession.ApproveAsync(
+                        userRequest,
+                        sql,
+                        cancellationToken: cancellationToken);
+                    if (!approvalResult.Success)
+                    {
+                        messages.Add(BuildToolMessage(call, $"SQL was rejected: {approvalResult.FailureMessage}"));
+                        continue;
+                    }
+
+                    var executionResult = await this.TryExecuteApprovedQueryWithRuntimeRetryAsync(userRequest, approvalResult);
+                    if (executionResult is null)
+                    {
+                        messages.Add(BuildToolMessage(call, "SQL execution failed after validation and repair attempts."));
+                        continue;
+                    }
+
+                    tablePrinter.Print(executionResult.Result);
+                    var nativeToolResult = this.BuildNativeToolResultMessage(
+                        userRequest,
+                        executionResult.ApprovedSql,
+                        executionResult.RenderedTable);
+                    messages.Add(BuildToolMessage(call, nativeToolResult));
+                    historyInput = this.BuildToolResultMessage(
+                        userRequest,
+                        executionResult.ApprovedSql,
+                        executionResult.RenderedTable);
+                    continue;
+
+                default:
+                    messages.Add(BuildToolMessage(call, $"Rejected: unknown tool '{call.Name}'. Use one of the advertised tools."));
+                    continue;
+            }
+        }
+
+        this.WriteAgentStepLimitReached();
+        return true;
+    }
+
+    private List<ChatMessage> BuildNativeMessages(string currentInstruction, bool includeHistory)
+    {
+        var messages = new List<ChatMessage> { new("system", this._agentSystemPrompt) };
+        if (includeHistory)
+        {
+            var remainingBudget = appConfig.MaxPromptChars
+                                  - this._agentSystemPrompt.Length
+                                  - currentInstruction.Length
+                                  - appConfig.PromptSafetyChars;
+            if (remainingBudget > 0)
+            {
+                messages.AddRange(this._agentHistory.BuildHistory(
+                    remainingBudget,
+                    assistantFormatter: FormatAnalyzerAssistantMessage,
+                    userFormatter: FormatAnalyzerUserMessage));
+            }
+        }
+
+        messages.Add(new ChatMessage("user", currentInstruction));
+        return messages;
+    }
+
+    private static ChatMessage BuildToolMessage(LlmToolCall call, string content) =>
+        new("tool", content, ToolCallId: call.Id, Name: call.Name);
+
+    private static bool TryGetStringArgument(JsonElement arguments, string name, out string value)
+    {
+        value = string.Empty;
+        if (arguments.ValueKind != JsonValueKind.Object
+            || !arguments.TryGetProperty(name, out var property)
+            || property.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(property.GetString()))
+        {
+            return false;
+        }
+
+        value = property.GetString()!.Trim();
         return true;
     }
 
@@ -347,13 +534,14 @@ public sealed class DbChatSession(
     {
         try
         {
-            return await ollamaClient.ChatAsync(
+            var result = await ollamaClient.ChatAsync(
                 llmName,
                 messages,
                 AgentAction.JsonSchema,
                 thinkLevel: this.GetRetryThinkLevel(attempt),
-                cancellationToken
+                cancellationToken: cancellationToken
             );
+            return result.Content;
         }
         catch (Exception ex)
         {
@@ -563,6 +751,95 @@ public sealed class DbChatSession(
 
         return builder.ToString().TrimEnd();
     }
+
+    private string BuildNativeToolResultMessage(
+        string originalUserRequest,
+        string approvedSql,
+        RenderedTable renderedTable)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("The validated SQL query completed successfully.");
+        builder.AppendLine($"Original user request: {originalUserRequest}");
+        builder.AppendLine($"Approved SQL: {approvedSql}");
+        builder.AppendLine($"Result rows: {renderedTable.TotalRows}");
+        builder.AppendLine(
+            $"Visible result shape: {renderedTable.ShownRows} row(s), {renderedTable.ShownColumns} column(s), {renderedTable.ShownCells} cell(s).");
+        if (renderedTable.Truncated)
+        {
+            builder.AppendLine($"The result was truncated to {appConfig.MaxAgentVisibleCells} visible cells.");
+        }
+
+        builder.AppendLine("Visible result grid:");
+        builder.AppendLine(renderedTable.Markdown);
+        builder.AppendLine("Summarize the result briefly in plain text. Do not render or reconstruct a table.");
+        return builder.ToString().TrimEnd();
+    }
+
+    private static IReadOnlyList<LlmToolDefinition> BuildToolDefinitions(ToolScope scope)
+    {
+        var tools = new List<LlmToolDefinition>
+        {
+            new(
+                "submit_sql",
+                "Submit one read-only Microsoft SQL Server query for application validation, security filtering, and execution.",
+                JsonDocument.Parse(
+                    """
+                    {"type":"object","properties":{"sql":{"type":"string","description":"A complete self-contained read-only T-SQL query."}},"required":["sql"],"additionalProperties":false}
+                    """).RootElement.Clone())
+        };
+
+        if (scope == ToolScope.Full)
+        {
+            tools.AddRange(
+            [
+                new LlmToolDefinition(
+                    "describe_database",
+                    "Retrieve the complete allowed database schema, relationships, and SQL guidance.",
+                    JsonDocument.Parse(
+                        """
+                        {"type":"object","properties":{},"additionalProperties":false}
+                        """).RootElement.Clone()),
+                new LlmToolDefinition(
+                    "clarify_request",
+                    "Ask the user one concise clarification question before attempting SQL.",
+                    JsonDocument.Parse(
+                        """
+                        {"type":"object","properties":{"question":{"type":"string"}},"required":["question"],"additionalProperties":false}
+                        """).RootElement.Clone()),
+                new LlmToolDefinition(
+                    "finish_conversation",
+                    "End the conversation when the user says goodbye or explicitly asks to stop.",
+                    JsonDocument.Parse(
+                        """
+                        {"type":"object","properties":{"message":{"type":"string"}},"additionalProperties":false}
+                        """).RootElement.Clone())
+            ]);
+        }
+
+        return tools;
+    }
+
+    private static string BuildNativeAgentSystemPrompt(string databaseName, string schemaPrompt) =>
+        $$"""
+          You are the database assistant for {{databaseName}}.
+          Answer supported informational requests directly in concise plain text.
+          For concrete data requests, call submit_sql with one read-only Microsoft SQL Server query proposal.
+          Use describe_database when detailed schema information is needed, clarify_request for one necessary clarification, and finish_conversation only for goodbye or stop requests.
+          Call exactly one tool at a time. Never claim that a tool succeeded until its result is returned.
+
+          Rules:
+          - Stay within database/domain information, query examples, concrete data requests, refinements, and returned-result explanations.
+          - Briefly redirect unrelated requests back to database topics.
+          - Use only the schema below and never invent tables, columns, relationships, or business filters.
+          - SQL must be self-contained, read-only SQL Server T-SQL with exact schema-qualified names.
+          - Never use LIMIT, RETURNING, markdown fences, comments, placeholders, variables, or parameters in SQL.
+          - Prefer simple SELECT, JOIN, WHERE, GROUP BY, and ORDER BY constructs.
+          - Never render or reconstruct a table in assistant text. The application renders tables; summarize visible results only.
+          - A short confirmation after a proposed option normally accepts the first option and should continue toward execution.
+
+          Initial allowed database schema:
+          {{schemaPrompt}}
+          """;
 
     private static string BuildAgentSystemPrompt(string databaseName, string schemaPrompt) =>
         $$"""

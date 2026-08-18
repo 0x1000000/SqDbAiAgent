@@ -73,6 +73,7 @@ public static class Program
                 ? serviceProvider.GetRequiredService<OpenRouterClient>()
                 : serviceProvider.GetRequiredService<OllamaClient>();
         });
+        builder.Services.AddSingleton<ToolCallingResolver>();
 
         builder.Services.AddSingleton<IConsoleOutput, ConsoleOutput>();
         builder.Services.AddSingleton<ILlmInteractionLogger, LlmInteractionLogger>();
@@ -128,6 +129,10 @@ public static class Program
 
             output.OutDebugLine(string.Empty);
             output.OutDebugLine($"Configured model '{configuredModel}' is available.");
+            var toolCalling = await host.Services.GetRequiredService<ToolCallingResolver>()
+                .ResolveAsync(appConfig.ToolCalling, configuredModel);
+            output.OutDebugLine(
+                $"Tool calling: requested={toolCalling.RequestedMode}, modelSupport={toolCalling.ModelSupportsTools}, effective={(toolCalling.UseNativeTools ? "Native" : "StructuredJson")}.");
             output.OutDebugLine(string.Empty);
             output.OutDebugLine("Checking database connection...");
 
