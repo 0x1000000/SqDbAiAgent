@@ -21,6 +21,7 @@ public sealed class DbChatService(
     IOptions<OllamaOptions> ollamaOptions,
     IOptions<OpenRouterOptions> openRouterOptions,
     ToolCallingResolver toolCallingResolver,
+    AgentFrameworkChatClientFactory agentFrameworkChatClientFactory,
     ISecurityFilterFactoryService securityFilterFactoryService)
     : IChatService
 {
@@ -45,7 +46,13 @@ public sealed class DbChatService(
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            var userRequest = (await output.ReadUserInput("Enter request:")).Trim();
+            var input = await output.ReadUserInput("Enter request:");
+            if (input is null)
+            {
+                return;
+            }
+
+            var userRequest = input.Trim();
 
             if (userRequest.ToLower() is "/exit" or "\\exit")
             {
@@ -59,7 +66,7 @@ public sealed class DbChatService(
         }
     }
 
-    private async Task<DbChatSession?> InitDbChatSession(
+    private async Task<IDbChatSession?> InitDbChatSession(
         AppConfig appConfig,
         string connectionString,
         string model,
@@ -89,31 +96,54 @@ public sealed class DbChatService(
 
         var userQuery = securityFilter.GetUsersQuery("UserId", "DisplayName");
 
-        var userId = await TryGetSecIdentity(connectionString, output, cancellationToken, userQuery);
+        var userSelection = await TryGetSecIdentity(connectionString, output, cancellationToken, userQuery);
+        if (userSelection.ExitRequested)
+        {
+            return null;
+        }
+
+        var userId = userSelection.UserId;
 
         var schemaPrompt = BuildSchemaPrompt(databaseName, tables);
         var analyzerSchemaPrompt = BuildAnalyzerSchemaPrompt(databaseName, tables);
 
         var messageAnalyzeSession = messageAnalyzeService.CreateSession(output, databaseName, tables, analyzerSchemaPrompt);
         var sqlApprovalSession = sqlApprovalService.CreateSession(output, databaseName, tables, schemaPrompt);
+        var executor = new ValidatedSqlExecutor(
+            output,
+            appConfig,
+            securityFilter,
+            tablePrinter,
+            agentTableFormatter,
+            sqlApprovalSession,
+            userId,
+            connectionString,
+            GetDb);
+
+        if (appConfig.AgentRuntime == AgentRuntime.MicrosoftAgentFramework)
+        {
+            return new AgentFrameworkDbChatSession(
+                output,
+                appConfig,
+                agentFrameworkChatClientFactory.Create(),
+                messageAnalyzeSession,
+                executor,
+                databaseName,
+                schemaPrompt);
+        }
+
         var toolCalling = await toolCallingResolver.ResolveAsync(appConfig.ToolCalling, model, cancellationToken);
 
         return new DbChatSession(
             output,
             appConfig,
-            securityFilter: securityFilter,
             ollamaClient: ollamaClient,
-            tablePrinter: tablePrinter,
-            agentTableFormatter: agentTableFormatter,
             messageAnalyzeSession: messageAnalyzeSession,
-            sqlApprovalSession: sqlApprovalSession,
-            userId,
+            validatedSqlExecutor: executor,
             schemaPrompt: schemaPrompt,
             llmName: model,
-            connectionString: connectionString,
             databaseName: databaseName,
-            useNativeTools: toolCalling.UseNativeTools,
-            dbFactory: GetDb
+            useNativeTools: toolCalling.UseNativeTools
         );
     }
 
@@ -141,7 +171,7 @@ public sealed class DbChatService(
             : builder.InitialCatalog;
     }
 
-    private static async Task<int?> TryGetSecIdentity(
+    private static async Task<UserSelection> TryGetSecIdentity(
         string connectionString,
         IConsoleOutput output,
         CancellationToken cancellationToken,
@@ -176,12 +206,19 @@ public sealed class DbChatService(
 
                 while (true)
                 {
-                    var userInput = (await output.ReadUserInput("Enter user id or /exit:")).Trim();
+                    var input = await output.ReadUserInput("Enter user id or /exit:");
+                    if (input is null)
+                    {
+                        output.OutDataLine("Exiting.");
+                        return new UserSelection(true, null);
+                    }
+
+                    var userInput = input.Trim();
 
                     if (string.Equals(userInput, "/exit", StringComparison.OrdinalIgnoreCase))
                     {
                         output.OutDataLine("Exiting.");
-                        return null;
+                        return new UserSelection(true, null);
                     }
 
                     if (int.TryParse(userInput, out var userId))
@@ -190,7 +227,7 @@ public sealed class DbChatService(
                         {
                             output.OutDataLine("No user was selected. The app will show all available data.");
                             output.OutDataLine(string.Empty);
-                            return null;
+                            return new UserSelection(false, null);
                         }
 
                         if (!users.ContainsKey(userId))
@@ -201,7 +238,7 @@ public sealed class DbChatService(
 
                         output.OutDataLine($"User {userId} was selected. The app will now show only the data available to that user.");
                         output.OutDataLine(string.Empty);
-                        return userId;
+                        return new UserSelection(false, userId);
                     }
 
                     output.OutErrorLine("Please enter a valid integer user id or /exit.");
@@ -210,11 +247,11 @@ public sealed class DbChatService(
             catch (Exception ex)
             {
                 output.OutError($"Could not execute user query: {ex.Message}");
-                return null;
+                return new UserSelection(false, null);
             }
         }
 
-        return null;
+        return new UserSelection(false, null);
     }
 
     private static string BuildSchemaPrompt(
@@ -339,5 +376,7 @@ public sealed class DbChatService(
             ? openRouterOptions.Model
             : ollamaOptions.Model;
     }
+
+    private readonly record struct UserSelection(bool ExitRequested, int? UserId);
 
 }

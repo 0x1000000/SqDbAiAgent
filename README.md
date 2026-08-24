@@ -7,6 +7,7 @@ The application sends database metadata to the agent, accepts SQL proposed by th
 ## Contents
 
 - [What the demo shows](#what-the-demo-shows)
+- [Agent runtimes](#agent-runtimes)
 - [HarborFlow demo database](#harborflow-demo-database)
 - [HarborFlow schema layout](#harborflow-schema-layout)
 - [HarborFlow entity overview](#harborflow-entity-overview)
@@ -26,6 +27,15 @@ The application sends database metadata to the agent, accepts SQL proposed by th
 - SqExpress validates that the query is read-only when the active security context has only read access.
 - If the security policy implies row-level visibility restrictions, SqExpress adds additional security predicates to the expression that is sent to the database, so the user does not see data that should not be visible.
 - The security logic is applied per database. In this demo, that logic is implemented by [HarborFlowSecurityFilter.cs](./SqDbAiAgent.Console/SecurityFilters/HarborFlow/HarborFlowSecurityFilter.cs).
+
+## Agent runtimes
+
+The project contains two interchangeable orchestration implementations so they can be evaluated against the same database and security boundary:
+
+- `Custom` is the original provider-neutral session implementation. It uses the project's `OllamaClient` or `OpenRouterClient` and supports either native tools or the structured `AgentAction` fallback.
+- `MicrosoftAgentFramework` uses Microsoft's `AIAgent` and `AgentSession`, Microsoft.Extensions.AI tool invocation, the OpenAI-compatible SDK adapter for OpenRouter, and OllamaSharp for Ollama. It does not call the project's custom provider clients.
+
+Both runtimes share message analysis, SQL approval and repair, SqExpress validation, HarborFlow security rewriting, execution, and result rendering through `ValidatedSqlExecutor`. Changing the runtime therefore compares orchestration/provider integration rather than bypassing the application's safety controls. See [AGENT_FRAMEWORK_COMPARISON.md](./AGENT_FRAMEWORK_COMPARISON.md) for the implementation comparison and real-session results.
 
 ## HarborFlow demo database
 
@@ -106,6 +116,8 @@ The main configuration areas are:
   SQL Server connection string used by the demo application.
 - `LlmProvider`
   Selects the active LLM provider. Supported values are currently `Ollama` and `OpenRouter`.
+- `AgentRuntime`
+  Selects `Custom` or `MicrosoftAgentFramework`. The default is `Custom` so the existing behavior remains unchanged.
 - `LlmLogFilePath`
   Path to the file where raw LLM request and response payloads are written when interaction logging is enabled.
 - `MaxAgentSteps`
@@ -129,7 +141,7 @@ The main configuration areas are:
   - `Disabled`
     Never request reasoning.
 - `ToolCalling`
-  Native tool-calling behavior. `Auto` uses provider model metadata and falls back to the existing structured JSON action protocol, `Enabled` requires tool support, and `Disabled` always uses structured JSON actions.
+  Native tool-calling behavior for the `Custom` runtime. `Auto` uses provider model metadata and falls back to the existing structured JSON action protocol, `Enabled` requires tool support, and `Disabled` always uses structured JSON actions. The `MicrosoftAgentFramework` runtime always uses framework-native tools.
 - `ToolScope`
   Set to `Minimal` to expose only `submit_sql`, or `Full` to also expose `describe_database`, `clarify_request`, and `finish_conversation`.
 - `MaxFixResponseAttempts`
@@ -275,7 +287,13 @@ Recent 5 sales orders (newest first): SO-2026-0040 (Approved, CAD, 2026-03-12), 
 - [Program.cs](./SqDbAiAgent.Console/Program.cs)  
   Application startup and provider wiring.
 - [DbChatSession.cs](./SqDbAiAgent.Console/Services/DbChatSession.cs)  
-  Main agent loop.
+  Custom main agent loop.
+- [AgentFrameworkDbChatSession.cs](./SqDbAiAgent.Console/Services/AgentFrameworkDbChatSession.cs)
+  Microsoft Agent Framework main agent and tool orchestration.
+- [AgentFrameworkChatClientFactory.cs](./SqDbAiAgent.Console/Services/AgentFrameworkChatClientFactory.cs)
+  Framework-side OpenRouter and Ollama adapters, independent of the custom provider clients.
+- [ValidatedSqlExecutor.cs](./SqDbAiAgent.Console/Services/ValidatedSqlExecutor.cs)
+  Shared SQL approval, security rewriting, execution, runtime repair, and rendering boundary.
 - [SqlApprovalSession.cs](./SqDbAiAgent.Console/Services/SqlApprovalSession.cs)  
   SQL approval and repair loop.
 - [MessageAnalyzeSession.cs](./SqDbAiAgent.Console/Services/MessageAnalyzeSession.cs)  

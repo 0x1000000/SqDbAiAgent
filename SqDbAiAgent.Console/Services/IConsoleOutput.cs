@@ -2,7 +2,7 @@ namespace SqDbAiAgent.ConsoleApp.Services;
 
 public interface IConsoleOutput
 {
-    Task<string> ReadUserInput(string? prompt);
+    Task<string?> ReadUserInput(string? prompt);
 
     void OutData(string text);
 

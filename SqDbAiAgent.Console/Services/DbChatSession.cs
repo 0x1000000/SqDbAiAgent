@@ -1,32 +1,20 @@
-using System.Data;
-using System.Diagnostics.CodeAnalysis;
 using System.Text;
 using System.Text.Json;
-using Microsoft.Data.SqlClient;
 using SqDbAiAgent.ConsoleApp.Conversation;
 using SqDbAiAgent.ConsoleApp.Models;
-using SqExpress;
-using SqExpress.DataAccess;
-using SqExpress.SqlExport;
 
 namespace SqDbAiAgent.ConsoleApp.Services;
 
 public sealed class DbChatSession(
     IConsoleOutput output,
     AppConfig appConfig,
-    ISecurityFilter securityFilter,
     ILlmClient ollamaClient,
-    ITablePrinter tablePrinter,
-    IAgentTableFormatter agentTableFormatter,
     IMessageAnalyzeSession messageAnalyzeSession,
-    ISqlApprovalSession sqlApprovalSession,
-    int? userId,
+    ValidatedSqlExecutor validatedSqlExecutor,
     string schemaPrompt,
     string llmName,
-    string connectionString,
     string databaseName,
-    bool useNativeTools,
-    Func<string, ISqDatabase> dbFactory)
+    bool useNativeTools) : IDbChatSession
 {
     private readonly string _agentSystemPrompt = useNativeTools
         ? BuildNativeAgentSystemPrompt(databaseName, schemaPrompt)
@@ -98,25 +86,15 @@ public sealed class DbChatSession(
                 return true;
             }
 
-            var approvalResult = await sqlApprovalSession.ApproveAsync(
+            var executionResult = await validatedSqlExecutor.SubmitAsync(
                 userRequest,
                 action.Value.Sql,
-                cancellationToken: cancellationToken
-            );
-            if (!approvalResult.Success)
-            {
-                this.WriteApprovalFailure(approvalResult);
-                return true;
-            }
-
-            var executionResult = await this.TryExecuteApprovedQueryWithRuntimeRetryAsync(userRequest, approvalResult);
+                cancellationToken);
             if (executionResult is null)
             {
                 output.OutDataLine(string.Empty);
                 return true;
             }
-
-            tablePrinter.Print(executionResult.Result);
 
             currentAgentInput = this.BuildToolResultMessage(
                 userRequest,
@@ -239,6 +217,14 @@ public sealed class DbChatSession(
                     return true;
 
                 case "finish_conversation":
+                    if (!ConversationExitPolicy.IsExplicitExitRequest(userRequest))
+                    {
+                        messages.Add(BuildToolMessage(
+                            call,
+                            "Rejected: the user did not explicitly ask to end the conversation. Continue answering the current request."));
+                        continue;
+                    }
+
                     TryGetStringArgument(call.Arguments, "message", out var goodbye);
                     var exitAction = new AgentAction(AgentActionType.Exit, goodbye, string.Empty);
                     this.AppendAgentTurn(userRequest, exitAction);
@@ -255,24 +241,15 @@ public sealed class DbChatSession(
                     submitSqlRequired = false;
                     var sqlAction = new AgentAction(AgentActionType.RunSql, string.Empty, sql);
                     this.AppendAgentTurn(historyInput, sqlAction);
-                    var approvalResult = await sqlApprovalSession.ApproveAsync(
+                    var executionResult = await validatedSqlExecutor.SubmitAsync(
                         userRequest,
                         sql,
-                        cancellationToken: cancellationToken);
-                    if (!approvalResult.Success)
-                    {
-                        messages.Add(BuildToolMessage(call, $"SQL was rejected: {approvalResult.FailureMessage}"));
-                        continue;
-                    }
-
-                    var executionResult = await this.TryExecuteApprovedQueryWithRuntimeRetryAsync(userRequest, approvalResult);
+                        cancellationToken);
                     if (executionResult is null)
                     {
-                        messages.Add(BuildToolMessage(call, "SQL execution failed after validation and repair attempts."));
+                        messages.Add(BuildToolMessage(call, "SQL was rejected or execution failed after validation and repair attempts."));
                         continue;
                     }
-
-                    tablePrinter.Print(executionResult.Result);
                     var nativeToolResult = this.BuildNativeToolResultMessage(
                         userRequest,
                         executionResult.ApprovedSql,
@@ -412,28 +389,6 @@ public sealed class DbChatSession(
         }
     }
 
-    private bool TryGetExecutableReadOnlyQuery(
-        SqlApprovalResult approvalResult,
-        [NotNullWhen(true)] out IExprQuery? query)
-    {
-        if (approvalResult.ParsedExpression is not IExprQuery exprQuery)
-        {
-            output.OutErrorLine("Only queries are supported right now.");
-            query = null;
-            return false;
-        }
-
-        if (exprQuery is not IExprReadOnlyQuery)
-        {
-            output.OutErrorLine("You have only read access to the database.");
-            query = null;
-            return false;
-        }
-
-        query = exprQuery;
-        return true;
-    }
-
     private async Task<AgentAction?> TryGetAgentActionAsync(
         string currentInstruction,
         bool includeHistory,
@@ -491,72 +446,6 @@ public sealed class DbChatSession(
         return null;
     }
 
-    private async Task<QueryExecutionResult?> TryExecuteApprovedQueryWithRuntimeRetryAsync(
-        string userRequest,
-        SqlApprovalResult approvalResult)
-    {
-        var currentApproval = approvalResult;
-
-        for (var attempt = 1; attempt <= appConfig.MaxSqlRuntimeFixAttempts + 1; attempt++)
-        {
-            if (!this.TryGetExecutableReadOnlyQuery(currentApproval, out var query))
-            {
-                return null;
-            }
-
-            if (!securityFilter.ValidateQuery(query, userId, out var safeQuery, out var error))
-            {
-                output.OutErrorLine(error);
-                return null;
-            }
-
-            query = (IExprQuery)safeQuery;
-
-            this.WriteAcceptedQuery(currentApproval.ApprovedSql, query);
-
-            try
-            {
-                var result = await this.ExecuteQueryAsync(query);
-                return new QueryExecutionResult(
-                    currentApproval.ApprovedSql,
-                    result,
-                    agentTableFormatter.RenderMarkdown(result, appConfig.MaxAgentVisibleCells)
-                );
-            }
-            catch (Exception ex)
-            {
-                var sqlException = FindSqlException(ex);
-                if (sqlException is null)
-                {
-                    throw;
-                }
-
-                this.WriteRuntimeFailure(attempt, currentApproval.ApprovedSql, sqlException.Message);
-
-                if (attempt > appConfig.MaxSqlRuntimeFixAttempts)
-                {
-                    this.WriteExecutionFailure("Could not execute query :( " + sqlException.Message);
-                    return null;
-                }
-
-                currentApproval = await sqlApprovalSession.ApproveAsync(
-                    userRequest,
-                    currentApproval.ApprovedSql,
-                    sqlException.Message,
-                    "runtime"
-                );
-
-                if (!currentApproval.Success)
-                {
-                    this.WriteExecutionFailure(currentApproval.FailureMessage);
-                    return null;
-                }
-            }
-        }
-
-        return null;
-    }
-
     private async Task<string?> TryChatJsonAsync(
         IReadOnlyList<ChatMessage> messages,
         string operationName,
@@ -593,52 +482,6 @@ public sealed class DbChatSession(
         return AgentAction.TryParseFromJson(trimmed, out var action)
             ? action
             : null;
-    }
-
-    private async Task<DataTable> ExecuteQueryAsync(IExprQuery expr)
-    {
-        await using var database = dbFactory(connectionString);
-
-        return await database.Query(
-            expr,
-            new DataTable(),
-            (table, reader) =>
-            {
-                if (table.Columns.Count == 0)
-                {
-                    for (var i = 0; i < reader.FieldCount; i++)
-                    {
-                        table.Columns.Add(GetUniqueColumnName(table, reader.GetName(i)));
-                    }
-                }
-
-                var row = table.NewRow();
-                for (var i = 0; i < reader.FieldCount; i++)
-                {
-                    row[i] = reader.GetValue(i);
-                }
-
-                table.Rows.Add(row);
-                return table;
-            }
-        );
-    }
-
-    private static string GetUniqueColumnName(DataTable table, string columnName)
-    {
-        var baseName = string.IsNullOrWhiteSpace(columnName) ? "Column" : columnName;
-        if (!table.Columns.Contains(baseName))
-        {
-            return baseName;
-        }
-
-        var suffix = 2;
-        while (table.Columns.Contains($"{baseName}_{suffix}"))
-        {
-            suffix++;
-        }
-
-        return $"{baseName}_{suffix}";
     }
 
     private static string StripMarkdownFence(string text)
@@ -716,19 +559,6 @@ public sealed class DbChatSession(
                 ? LlmThinkLevel.Low
                 : LlmThinkLevel.Disabled
         };
-    }
-
-    private static SqlException? FindSqlException(Exception exception)
-    {
-        for (Exception? current = exception; current is not null; current = current.InnerException)
-        {
-            if (current is SqlException sqlException)
-            {
-                return sqlException;
-            }
-        }
-
-        return null;
     }
 
     private static string BuildDefaultOffTopicMessage(string databaseName, string modelMessage)
@@ -995,17 +825,6 @@ public sealed class DbChatSession(
         output.OutDataLine(string.Empty);
     }
 
-    private void WriteApprovalFailure(SqlApprovalResult approvalResult)
-    {
-        output.OutErrorLine(approvalResult.FailureMessage);
-        output.OutDataLine(string.Empty);
-    }
-
-    private void WriteExecutionFailure(string message)
-    {
-        output.OutErrorLine(message);
-    }
-
     private void WriteInvalidActionResponse(int attempt, string reply)
     {
         output.OutDebugLine($"Model returned invalid or unsupported action JSON on attempt {attempt}.");
@@ -1020,23 +839,4 @@ public sealed class DbChatSession(
         output.OutDebugLine(string.Empty);
     }
 
-    private void WriteAcceptedQuery(string sql, IExprQuery query)
-    {
-        output.OutDebugLine("Accepted query: ");
-        output.OutDebug(sql);
-        output.OutDebugLine(string.Empty);
-        output.OutDebugLine("Query to execute: ");
-        output.OutDebugLine(query.ToSql(TSqlExporter.Default));
-        output.OutDebugLine(string.Empty);
-    }
-
-    private void WriteRuntimeFailure(int attempt, string sql, string errorMessage)
-    {
-        output.OutDebugLine($"SQL runtime failed on attempt {attempt}: {errorMessage}");
-        output.OutDebugLine("Wrong T-SQL:");
-        output.OutDebugLine(sql);
-        output.OutDebugLine(string.Empty);
-    }
-
-    private sealed record QueryExecutionResult(string ApprovedSql, DataTable Result, RenderedTable RenderedTable);
 }

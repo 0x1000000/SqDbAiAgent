@@ -2,13 +2,13 @@ namespace SqDbAiAgent.ConsoleApp.Services;
 
 public sealed class ConsoleOutput : IConsoleOutput
 {
-    public Task<string> ReadUserInput(string? prompt)
+    public Task<string?> ReadUserInput(string? prompt)
     {
         if (!string.IsNullOrEmpty(prompt))
         {
             Console.Write(prompt);
         }
-        return Task.FromResult(Console.ReadLine() ?? string.Empty);
+        return Task.FromResult(Console.ReadLine());
     }
 
     public void OutData(string text)

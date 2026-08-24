@@ -69,10 +69,17 @@ public static class Program
         builder.Services.AddSingleton<ILlmClient>(serviceProvider =>
         {
             var appConfig = serviceProvider.GetRequiredService<IOptions<AppConfig>>().Value;
+            if (appConfig.AgentRuntime == AgentRuntime.MicrosoftAgentFramework)
+            {
+                return serviceProvider.GetRequiredService<AgentFrameworkLlmClient>();
+            }
+
             return IsOpenRouter(appConfig.LlmProvider)
                 ? serviceProvider.GetRequiredService<OpenRouterClient>()
                 : serviceProvider.GetRequiredService<OllamaClient>();
         });
+        builder.Services.AddSingleton<AgentFrameworkChatClientFactory>();
+        builder.Services.AddSingleton<AgentFrameworkLlmClient>();
         builder.Services.AddSingleton<ToolCallingResolver>();
 
         builder.Services.AddSingleton<IConsoleOutput, ConsoleOutput>();
@@ -129,10 +136,18 @@ public static class Program
 
             output.OutDebugLine(string.Empty);
             output.OutDebugLine($"Configured model '{configuredModel}' is available.");
-            var toolCalling = await host.Services.GetRequiredService<ToolCallingResolver>()
-                .ResolveAsync(appConfig.ToolCalling, configuredModel);
-            output.OutDebugLine(
-                $"Tool calling: requested={toolCalling.RequestedMode}, modelSupport={toolCalling.ModelSupportsTools}, effective={(toolCalling.UseNativeTools ? "Native" : "StructuredJson")}.");
+            output.OutDebugLine($"Agent runtime: {appConfig.AgentRuntime}.");
+            if (appConfig.AgentRuntime == AgentRuntime.MicrosoftAgentFramework)
+            {
+                output.OutDebugLine("Tool orchestration: Microsoft Agent Framework.");
+            }
+            else
+            {
+                var toolCalling = await host.Services.GetRequiredService<ToolCallingResolver>()
+                    .ResolveAsync(appConfig.ToolCalling, configuredModel);
+                output.OutDebugLine(
+                    $"Tool calling: requested={toolCalling.RequestedMode}, modelSupport={toolCalling.ModelSupportsTools}, effective={(toolCalling.UseNativeTools ? "Native" : "StructuredJson")}.");
+            }
             output.OutDebugLine(string.Empty);
             output.OutDebugLine("Checking database connection...");
 
