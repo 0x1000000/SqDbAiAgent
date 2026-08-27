@@ -1,5 +1,3 @@
-using System;
-using System.Collections.Generic;
 using AiDbClient.ConsoleApp.Tables;
 using SqDbAiAgent.ConsoleApp.Tables;
 using SqExpress;

@@ -1,5 +1,3 @@
-using SqDbAiAgent.ConsoleApp.Models;
-
 namespace SqDbAiAgent.ConsoleApp.Conversation;
 
 public sealed class ChatHistoryManager<TAssistant>

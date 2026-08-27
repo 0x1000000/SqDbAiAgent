@@ -4,8 +4,6 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
-using SqDbAiAgent.ConsoleApp.Models;
-using SqDbAiAgent.ConsoleApp.Services;
 
 namespace SqDbAiAgent.ConsoleApp;
 
@@ -13,6 +11,22 @@ public static class Program
 {
     public static async Task<int> Main(string[] args)
     {
+        if (!McpLaunchOptions.TryParse(args, out var launchOptions, out var launchError))
+        {
+            Console.Error.WriteLine(launchError);
+            return 1;
+        }
+
+        if (launchOptions.Transport == McpTransport.Http)
+        {
+            return await McpServerHost.RunHttpAsync(args);
+        }
+
+        if (launchOptions.Transport == McpTransport.Stdio)
+        {
+            return await McpServerHost.RunStdioAsync(args, launchOptions.DatabaseUserId);
+        }
+
         var builder = Host.CreateApplicationBuilder(args);
 
         builder.Configuration
@@ -51,7 +65,7 @@ public static class Program
                 "OpenRouter BaseUrl must be a valid absolute URI.");
 
         builder.Services
-            .AddHttpClient<OllamaClient>((serviceProvider, httpClient) =>
+            .AddHttpClient<OllamaClientService>((serviceProvider, httpClient) =>
             {
                 var options = serviceProvider.GetRequiredService<IOptions<OllamaOptions>>().Value;
                 httpClient.BaseAddress = new Uri(EnsureTrailingSlash(options.BaseUrl));
@@ -59,7 +73,7 @@ public static class Program
             });
 
         builder.Services
-            .AddHttpClient<OpenRouterClient>((serviceProvider, httpClient) =>
+            .AddHttpClient<OpenRouterClientService>((serviceProvider, httpClient) =>
             {
                 var options = serviceProvider.GetRequiredService<IOptions<OpenRouterOptions>>().Value;
                 httpClient.BaseAddress = new Uri(EnsureTrailingSlash(options.BaseUrl));
@@ -69,28 +83,20 @@ public static class Program
         builder.Services.AddSingleton<ILlmClient>(serviceProvider =>
         {
             var appConfig = serviceProvider.GetRequiredService<IOptions<AppConfig>>().Value;
-            if (appConfig.AgentRuntime == AgentRuntime.MicrosoftAgentFramework)
-            {
-                return serviceProvider.GetRequiredService<AgentFrameworkLlmClient>();
-            }
-
             return IsOpenRouter(appConfig.LlmProvider)
-                ? serviceProvider.GetRequiredService<OpenRouterClient>()
-                : serviceProvider.GetRequiredService<OllamaClient>();
+                ? serviceProvider.GetRequiredService<OpenRouterClientService>()
+                : serviceProvider.GetRequiredService<OllamaClientService>();
         });
-        builder.Services.AddSingleton<AgentFrameworkChatClientFactory>();
-        builder.Services.AddSingleton<AgentFrameworkLlmClient>();
-        builder.Services.AddSingleton<ToolCallingResolver>();
+        builder.Services.AddSingleton<ToolCallingResolverService>();
 
-        builder.Services.AddSingleton<IConsoleOutput, ConsoleOutput>();
-        builder.Services.AddSingleton<ILlmInteractionLogger, LlmInteractionLogger>();
-        builder.Services.AddSingleton<ITablePrinter, ConsoleTablePrinter>();
-        builder.Services.AddSingleton<IAgentTableFormatter>(serviceProvider =>
-            (ConsoleTablePrinter)serviceProvider.GetRequiredService<ITablePrinter>());
-        builder.Services.AddSingleton<IMessageAnalyzeService, MessageAnalyzeService>();
-        builder.Services.AddSingleton<ISqlApprovalService, SqlApprovalService>();
-        builder.Services.AddSingleton<IChatService, DbChatService>();
-        builder.Services.AddSingleton<ISecurityFilterFactoryService, DefaultSecurityFilterFactoryService>();
+        builder.Services.AddSingleton<IConsoleOutput, ConsoleOutputService>();
+        builder.Services.AddSingleton<LlmInteractionLoggerService>();
+        builder.Services.AddSingleton<TableResultFormatterService>();
+        builder.Services.AddSingleton<MessageAnalyzeService>();
+        builder.Services.AddSingleton<SqlApprovalService>();
+        builder.Services.AddSingleton<DbChatService>();
+        builder.Services.AddSingleton<SecurityFilterFactoryService>();
+        builder.Services.AddSingleton<DatabaseContextService>();
 
         using var host = builder.Build();
 
@@ -101,8 +107,8 @@ public static class Program
             var ollamaOptions = host.Services.GetRequiredService<IOptions<OllamaOptions>>().Value;
             var openRouterOptions = host.Services.GetRequiredService<IOptions<OpenRouterOptions>>().Value;
             var output = host.Services.GetRequiredService<IConsoleOutput>();
-            var chatService = host.Services.GetRequiredService<IChatService>();
-            var interactionLogger = host.Services.GetRequiredService<ILlmInteractionLogger>();
+            var chatService = host.Services.GetRequiredService<DbChatService>();
+            var interactionLogger = host.Services.GetRequiredService<LlmInteractionLoggerService>();
             var providerName = appConfig.LlmProvider;
             var baseUrl = IsOpenRouter(providerName) ? openRouterOptions.BaseUrl : ollamaOptions.BaseUrl;
             var configuredModel = IsOpenRouter(providerName) ? openRouterOptions.Model : ollamaOptions.Model;
@@ -136,18 +142,10 @@ public static class Program
 
             output.OutDebugLine(string.Empty);
             output.OutDebugLine($"Configured model '{configuredModel}' is available.");
-            output.OutDebugLine($"Agent runtime: {appConfig.AgentRuntime}.");
-            if (appConfig.AgentRuntime == AgentRuntime.MicrosoftAgentFramework)
-            {
-                output.OutDebugLine("Tool orchestration: Microsoft Agent Framework.");
-            }
-            else
-            {
-                var toolCalling = await host.Services.GetRequiredService<ToolCallingResolver>()
-                    .ResolveAsync(appConfig.ToolCalling, configuredModel);
-                output.OutDebugLine(
-                    $"Tool calling: requested={toolCalling.RequestedMode}, modelSupport={toolCalling.ModelSupportsTools}, effective={(toolCalling.UseNativeTools ? "Native" : "StructuredJson")}.");
-            }
+            var toolCalling = await host.Services.GetRequiredService<ToolCallingResolverService>()
+                .ResolveAsync(appConfig.ToolCalling, configuredModel);
+            output.OutDebugLine(
+                $"Tool calling: requested={toolCalling.RequestedMode}, modelSupport={toolCalling.ModelSupportsTools}, effective={(toolCalling.UseNativeTools ? "Native" : "StructuredJson")}.");
             output.OutDebugLine(string.Empty);
             output.OutDebugLine("Checking database connection...");
 

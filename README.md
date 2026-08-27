@@ -1,41 +1,253 @@
 # SqDbAiAgent Demo
 
-This repository contains a demo application that shows how the [SqExpress](https://github.com/0x1000000/SqExpress) library can be utilized as a tool for an AI agent.
+This repository demonstrates how an AI assistant can answer questions about a SQL Server database without giving generated SQL unrestricted access to it. Users ask questions in ordinary language; the application gives the agent a controlled description of the exposed schema and lets it propose read-only queries when data is needed.
 
-The application sends database metadata to the agent, accepts SQL proposed by the agent, parses that SQL with SqExpress, validates it, optionally rewrites it with security predicates, and only then sends the resulting query to SQL Server.
+Generated SQL is treated as an untrusted proposal. [SqExpress](https://github.com/0x1000000/SqExpress) parses it into an expression tree, checks it against the exposed tables and columns, rejects unsupported or unsafe operations, and adds a default row limit when the query has no explicit outer limit. The application can then apply a database-specific security policy before executing the resulting query and returning a bounded, user-oriented answer. Narrow investigation queries use the same path when the agent needs to resolve a concrete uncertainty before producing its final response.
+
+The same protected database capabilities are available in two forms: a built-in interactive chat and an MCP server for external AI clients. Interactive chat performs the conversation and tool orchestration itself. MCP mode exposes the schema and query tools over HTTP or standard input/output while leaving orchestration to the connected client; it does not initialize an LLM of its own.
 
 ## Contents
 
-- [What the demo shows](#what-the-demo-shows)
-- [Agent runtimes](#agent-runtimes)
+- [Getting started](#getting-started)
+- [Configuration](#configuration)
+- [Design principles](#design-principles)
+- [MCP server](#mcp-server)
 - [HarborFlow demo database](#harborflow-demo-database)
 - [HarborFlow schema layout](#harborflow-schema-layout)
 - [HarborFlow entity overview](#harborflow-entity-overview)
 - [Security model in the demo](#security-model-in-the-demo)
-- [Configuration](#configuration)
-- [LLM provider choice](#llm-provider-choice)
 - [Example conversation](#example-conversation)
 - [Files of interest](#files-of-interest)
 
-## What the demo shows
+## Getting started
 
-- It provides a list of tables, columns, and relationships to the agent.
-- The agent is supposed to generate SQL code.
-- The SQL is parsed by SqExpress.
-- SqExpress validates that the provided T-SQL is syntactically correct for the supported parser surface.
-- SqExpress validates that only existing and allowed tables and columns are used in the query.
-- SqExpress validates that the query is read-only when the active security context has only read access.
-- If the security policy implies row-level visibility restrictions, SqExpress adds additional security predicates to the expression that is sent to the database, so the user does not see data that should not be visible.
-- The security logic is applied per database. In this demo, that logic is implemented by [HarborFlowSecurityFilter.cs](./SqDbAiAgent.Console/SecurityFilters/HarborFlow/HarborFlowSecurityFilter.cs).
+Install the .NET 8 SDK and ensure that SQL Server is reachable. To work with the included [HarborFlow demo database](#harborflow-demo-database), create it first by running [db_create.sql](./db_create.sql) against SQL Server. Then copy [appsettings.Development.example.json](./SqDbAiAgent.Console/appsettings.Development.example.json) to `SqDbAiAgent.Console/appsettings.Development.json`.
 
-## Agent runtimes
+Before starting the application, review these settings in the development file:
 
-The project contains two interchangeable orchestration implementations so they can be evaluated against the same database and security boundary:
+- **Every mode:** set `App:ConnectionString` to the target SQL Server database. This is the primary required setting because schema discovery and every query use this connection.
+- **Interactive chat:** select `App:LlmProvider`. For the default local setup, configure `Ollama:BaseUrl` and `Ollama:Model` and ensure Ollama is running. When using OpenRouter instead, configure `OpenRouter:Model` and provide `OpenRouter:ApiKey` through a local setting or environment variable.
+- **HTTP MCP:** replace `McpHttp:ApiKey` and change `McpHttp:Url` if the default `http://localhost:5080` listener is unsuitable.
+- **Stdio MCP:** no LLM or HTTP configuration is used; only the database settings are required.
 
-- `Custom` is the original provider-neutral session implementation. It uses the project's `OllamaClient` or `OpenRouterClient` and supports either native tools or the structured `AgentAction` fallback.
-- `MicrosoftAgentFramework` uses Microsoft's `AIAgent` and `AgentSession`, Microsoft.Extensions.AI tool invocation, the OpenAI-compatible SDK adapter for OpenRouter, and OllamaSharp for Ollama. It does not call the project's custom provider clients.
+With no `--transport` argument, the application starts interactive chat using the configured provider and model. The HTTP and stdio transports start an MCP server instead and do not initialize an LLM.
 
-Both runtimes share message analysis, SQL approval and repair, SqExpress validation, HarborFlow security rewriting, execution, and result rendering through `ValidatedSqlExecutor`. Changing the runtime therefore compares orchestration/provider integration rather than bypassing the application's safety controls. See [AGENT_FRAMEWORK_COMPARISON.md](./AGENT_FRAMEWORK_COMPARISON.md) for the implementation comparison and real-session results.
+1. Interactive chat
+
+   ```powershell
+   dotnet run --project SqDbAiAgent.Console\SqDbAiAgent.ConsoleApp.csproj
+   ```
+
+2. MCP over HTTP
+
+   ```powershell
+   dotnet run --project SqDbAiAgent.Console\SqDbAiAgent.ConsoleApp.csproj -- --transport http
+   ```
+
+3. MCP over stdio
+
+   ```powershell
+   dotnet run --project SqDbAiAgent.Console\SqDbAiAgent.ConsoleApp.csproj -- --transport stdio
+   ```
+
+## Configuration
+
+The application is configured through [appsettings.json](./SqDbAiAgent.Console/appsettings.json).
+
+For local development overrides, you can also use `SqDbAiAgent.Console/appsettings.Development.json`. This file is git-ignored so it is a safe place for machine-local settings such as API keys. The application loads it automatically after the base `appsettings.json`, so values in it override the shared defaults without requiring extra environment setup. A tracked starter file is available at [appsettings.Development.example.json](./SqDbAiAgent.Console/appsettings.Development.example.json).
+
+The complete configuration, shown with comments, is:
+
+```jsonc
+{
+  "App": {
+    // SQL Server connection used for schema discovery and query execution.
+    "ConnectionString": "Server=(local);Database=HarborFlow;Integrated Security=True;TrustServerCertificate=True",
+
+    // Interactive LLM provider: Ollama or OpenRouter. MCP mode does not use it.
+    "LlmProvider": "Ollama",
+
+    // Optional file for raw LLM request and response logging; empty disables it.
+    "LlmLogFilePath": "",
+
+    // Maximum agent-loop steps for one user request.
+    "MaxAgentSteps": 5,
+
+    // Maximum result cells rendered back into the agent's context.
+    "MaxAgentVisibleCells": 1000,
+
+    // Added through the SqExpress tree when no outer TOP or OFFSET/FETCH exists.
+    // An explicit query limit, including a larger one, is preserved.
+    "DefaultQueryRowLimit": 100,
+
+    // Enables investigation in interactive chat; MCP always exposes the tool.
+    "InvestigationEnabled": false,
+
+    // Maximum investigation probes allowed for one interactive request.
+    "MaxInvestigationQueries": 3,
+
+    // Maximum investigation result cells returned to the agent as evidence.
+    "MaxInvestigationVisibleCells": 100,
+
+    // Approval/repair attempts before an invalid SQL proposal is abandoned.
+    "MaxSqlFixAttempts": 10,
+
+    // Additional repair attempts after SQL Server rejects approved SQL at runtime.
+    "MaxSqlRuntimeFixAttempts": 3,
+
+    // Attempts to obtain a valid structured agent action or message analysis.
+    "MaxClassificationAttempts": 3,
+
+    // In Auto mode, reasoning begins after this many failed attempts.
+    "ThinkAfterAttempt": 3,
+
+    // Auto, Enabled, or Disabled.
+    "Reasoning": "Auto",
+
+    // Auto, Enabled, or Disabled. Auto falls back to structured JSON actions
+    // when the selected model does not support native tool calling.
+    "ToolCalling": "Auto",
+
+    // Minimal exposes submit_sql only. Full also exposes describe_database,
+    // clarify_request, and finish_conversation.
+    "ToolScope": "Full",
+
+    // Attempts to obtain one valid SQL-repair response.
+    "MaxFixResponseAttempts": 3,
+
+    // Repeated unchanged SQL responses allowed before repair is stopped.
+    "MaxUnchangedSqlResponses": 2,
+
+    // Total character budget for prompt, request, history, and tool results.
+    "MaxPromptChars": 32000,
+
+    // Reserved space below the effective prompt limit.
+    "PromptSafetyChars": 1500
+  },
+
+  "McpHttp": {
+    // Streamable HTTP listener; the MCP endpoint is /mcp.
+    "Url": "http://localhost:5080",
+
+    // Bearer token required by every HTTP MCP request. Replace this placeholder,
+    // preferably through the McpHttp__ApiKey environment variable.
+    "ApiKey": "CHANGE_ME",
+
+    // Enables non-sensitive operational output in HTTP mode. Stdio mode always
+    // keeps stdout exclusively for MCP protocol traffic.
+    "ConsoleOutputEnabled": false
+  },
+
+  "Ollama": {
+    // Local Ollama endpoint and model used by interactive chat.
+    "BaseUrl": "http://localhost:11434",
+    "Model": "qwen3.5:4b",
+    "TimeoutSeconds": 180
+  },
+
+  "OpenRouter": {
+    // OpenAI-compatible OpenRouter endpoint and credentials.
+    "BaseUrl": "https://openrouter.ai/api/v1",
+    "ApiKey": "",
+    "Model": "openai/gpt-5.4-nano",
+
+    // Optional headers identifying the calling application.
+    "Referer": "",
+    "Title": "SqDbAiAgent",
+    "TimeoutSeconds": 180
+  }
+}
+```
+
+### LLM provider choice
+
+For debugging and local experimentation, it makes sense to use a local LLM through Ollama.
+
+In practice, `qwen3.5:4b` is a reasonable starting point for this demo. It provides acceptable results on consumer hardware and was usable on an RTX 3070 during development, especially for simpler requests and validation flow testing.
+
+For better query quality, especially on harder analytical requests, a premium cloud LLM is usually required. That is why this project also includes an OpenRouter client, so the same application can be pointed at a stronger hosted model when higher-quality results are needed.
+
+In short:
+
+- use `Ollama` for local debugging, development, and fast iteration
+- use `OpenRouter` when you want access to stronger hosted models
+
+## Design principles
+
+SqDbAiAgent separates the agent's reasoning from the application's authority. The model may decide what information it needs and propose SQL, but it never receives a direct database connection and does not decide whether its own query is safe. The application owns schema exposure, validation, security enforcement, execution, and result bounds.
+
+The same principles apply whether a request comes from the built-in chat or an external MCP client:
+
+- **Schema-bounded access.** The agent receives the configured catalog name and only the exposed tables, columns, SQL types, and inferred relationships. Proposed SQL may reference only that schema.
+- **Deterministic approval.** Final queries are parsed by SqExpress and checked for read-only behavior before execution. Unknown objects, metadata access, mutations, and unsupported syntax are rejected.
+- **Bounded results.** Queries without an explicit outer `TOP` or `OFFSET ... FETCH` receive `App:DefaultQueryRowLimit` through the SqExpress expression tree. Explicit outer limits are preserved, while rendered results are independently bounded before entering agent context.
+- **Security outside the prompt.** A configured security policy may rewrite an approved expression with visibility predicates. Selectable identities are offered only when the connected database has a corresponding security profile.
+- **Focused investigation.** The agent may run a narrow probe to resolve a concrete uncertainty such as a stored code, date boundary, null pattern, possible EAV value, filter, or zero-row result. Investigation evidence informs the final response but is not presented as the answer itself.
+
+Interactive chat exposes these capabilities through native tools when supported and through structured JSON actions otherwise. Its minimal tool scope contains `submit_sql`; full scope also includes `describe_database`, `clarify_request`, and `finish_conversation`. `investigate_sql` is available when `InvestigationEnabled` is enabled.
+
+MCP exposes `get_database_schema`, `submit_sql`, and `investigate_sql`. It conditionally exposes `list_security_users` when a selectable-user security profile exists. The external MCP agent owns orchestration, so investigation is always available in MCP.
+
+Final and investigation SQL share the same parser, exposed-schema allow-list, read-only enforcement, configured security policy, SqExpress rewriting, and SQL Server execution path. A row-returning investigation must use a bounded `TOP` and either `DISTINCT` or a selective `WHERE`; alternatively, it may return one aggregate value. Broad scans, `SELECT *`, metadata queries, grouped aggregates, and multiple result sets are rejected. Interactive chat also rejects duplicate probes and probes beyond `MaxInvestigationQueries`.
+
+The schema guidance notes that Entity/Attribute/Value is a common relational pattern, but the application does not automatically detect, sample, or assume an EAV mapping.
+
+## MCP server
+
+Both MCP transports expose the `database://schema` resource and the tools described in [Design principles](#design-principles). During initialization, the server sends its database workflow as automatic MCP instructions and also exposes the same guidance through the `database_agent` prompt.
+
+The configured catalog name from `App:ConnectionString` appears in the instructions and schema payload so the external agent can identify the connected database. Prompt templates and MCP descriptions contain no hard-coded demo-domain name. MCP performs no LLM-based SQL repair; deterministic validation and SQL Server errors are returned to the client.
+
+### HTTP transport
+
+Configure a non-placeholder API key:
+
+```json
+{
+  "McpHttp": {
+    "Url": "http://localhost:5080",
+    "ApiKey": "replace-with-a-long-random-secret",
+    "ConsoleOutputEnabled": false
+  }
+}
+```
+
+Start the server with:
+
+```text
+SqDbAiAgent.ConsoleApp.exe --transport http
+```
+
+Prefer the `McpHttp__ApiKey` environment variable for the secret. The stateless streamable HTTP endpoint is `/mcp`, and every request requires `Authorization: Bearer <key>` using fixed-time key comparison. Operational console output is disabled unless `McpHttp:ConsoleOutputEnabled` is `true`.
+
+When a selectable-user security profile is available, the HTTP client supplies the selected identity through `X-Database-User-Id`. When no such profile exists, the security-user tool and its related instructions are not exposed.
+
+Plain HTTP does not protect the bearer token in transit. Use the default loopback listener for local access or place the server behind properly configured HTTPS.
+
+### Stdio transport
+
+Start a local MCP stdio server with:
+
+```text
+SqDbAiAgent.ConsoleApp.exe --transport stdio
+```
+
+Use `--database-user-id 7` to bind the process to a selectable security identity when the connected database has a corresponding security profile. Omitting the argument or using `0` selects the trusted, unfiltered local view. A positive ID is validated during startup and cannot be changed through tools.
+
+Stdout is reserved exclusively for MCP protocol traffic. Application and framework console output is disabled; fatal startup diagnostics use stderr. HTTP URL, API-key, and console-output settings do not apply to stdio.
+
+`--transport` accepts only `http` and `stdio`. The documented form uses separate option and value arguments. For compatibility with launchers that produce one combined argument, `--transport=stdio` and `"--transport stdio"` are also accepted.
+
+Configure the MCP client to launch the Release executable as a local stdio server. For clients that use a TOML server table, the equivalent entry is:
+
+```toml
+[mcp_servers.sq-db-ai]
+enabled = true
+command = '<repository-path>\SqDbAiAgent.Console\bin\Release\net8.0\SqDbAiAgent.ConsoleApp.exe'
+args = ["--transport", "stdio"]
+```
+
+Restart the MCP client after rebuilding the executable or changing its configuration. Confirm that `sq-db-ai` is connected through the client's MCP status view, then ask naturally, for example: `Use sq-db-ai to summarize the available data.`
 
 ## HarborFlow demo database
 
@@ -95,107 +307,12 @@ At a high level:
 
 This keeps the security policy in application code instead of in the prompt, and allows the same general agent flow to be reused for different databases with different security filters.
 
-## Configuration
-
-The console application is configured through [appsettings.json](./SqDbAiAgent.Console/appsettings.json).
-
-For local development overrides, you can also use `SqDbAiAgent.Console/appsettings.Development.json`. This file is git-ignored so it is a safe place for machine-local settings such as API keys. The application loads it automatically after the base `appsettings.json`, so values in it override the shared defaults without requiring extra environment setup. A tracked starter file is available at [appsettings.Development.example.json](./SqDbAiAgent.Console/appsettings.Development.example.json).
-
-The main configuration areas are:
-
-- `App`
-  General application behavior such as the database connection string, active LLM provider, retry limits, prompt-size limits, and logging.
-- `Ollama`
-  Settings for a local Ollama endpoint, including base URL, model name, and timeout.
-- `OpenRouter`
-  Settings for OpenRouter, including base URL, API key, model name, and timeout.
-
-### `App` section
-
-- `ConnectionString`
-  SQL Server connection string used by the demo application.
-- `LlmProvider`
-  Selects the active LLM provider. Supported values are currently `Ollama` and `OpenRouter`.
-- `AgentRuntime`
-  Selects `Custom` or `MicrosoftAgentFramework`. The default is `Custom` so the existing behavior remains unchanged.
-- `LlmLogFilePath`
-  Path to the file where raw LLM request and response payloads are written when interaction logging is enabled.
-- `MaxAgentSteps`
-  Maximum number of agent loop steps for a single user request before the app stops the loop.
-- `MaxAgentVisibleCells`
-  Maximum number of result cells rendered into the bounded Markdown table that is sent back to the agent after query execution.
-- `MaxSqlFixAttempts`
-  Maximum number of SQL approval and repair attempts before the app gives up.
-- `MaxSqlRuntimeFixAttempts`
-  Maximum number of additional repair attempts after SQL Server rejects an approved query at execution time.
-- `MaxClassificationAttempts`
-  Maximum number of attempts to get a valid structured response from the model for agent-action or message-analysis calls.
-- `ThinkAfterAttempt`
-  In `Auto` reasoning mode, low reasoning is enabled only after this attempt number has already passed.
-- `Reasoning`
-  Global reasoning behavior for LLM calls. Supported values are:
-  - `Auto`
-    Start with no reasoning and enable low reasoning only on later retries.
-  - `Enabled`
-    Always request reasoning.
-  - `Disabled`
-    Never request reasoning.
-- `ToolCalling`
-  Native tool-calling behavior for the `Custom` runtime. `Auto` uses provider model metadata and falls back to the existing structured JSON action protocol, `Enabled` requires tool support, and `Disabled` always uses structured JSON actions. The `MicrosoftAgentFramework` runtime always uses framework-native tools.
-- `ToolScope`
-  Set to `Minimal` to expose only `submit_sql`, or `Full` to also expose `describe_database`, `clarify_request`, and `finish_conversation`.
-- `MaxFixResponseAttempts`
-  Maximum number of attempts to get one valid SQL-fix JSON response for a single repair step.
-- `MaxUnchangedSqlResponses`
-  Maximum number of times the fixer may return the same SQL text again before the repair step is aborted.
-- `MaxPromptChars`
-  Character budget for one prompt, including system prompt, current request, history, and tool-result context.
-- `PromptSafetyChars`
-  Reserved character budget to reduce the risk of overrunning the effective prompt limit.
-
-### `Ollama` section
-
-- `BaseUrl`
-  Base address of the local Ollama server, for example `http://localhost:11434`.
-- `Model`
-  Name of the local Ollama model to use.
-- `TimeoutSeconds`
-  HTTP timeout for Ollama requests.
-
-### `OpenRouter` section
-
-- `BaseUrl`
-  Base address of the OpenRouter API, normally `https://openrouter.ai/api/v1`.
-- `ApiKey`
-  OpenRouter API key.
-- `Model`
-  OpenRouter model identifier.
-- `Referer`
-  Optional HTTP referer header. This is mainly useful when identifying a hosted app or project page.
-- `Title`
-  Optional OpenRouter request title.
-- `TimeoutSeconds`
-  HTTP timeout for OpenRouter requests.
-
-### LLM provider choice
-
-For debugging and local experimentation, it makes sense to use a local LLM through Ollama.
-
-In practice, `qwen3.5:4b` is a reasonable starting point for this demo. It provides acceptable results on consumer hardware and was usable on an RTX 3070 during development, especially for simpler requests and validation flow testing.
-
-For better query quality, especially on harder analytical requests, a premium cloud LLM is usually required. That is why this project also includes an OpenRouter client, so the same application can be pointed at a stronger hosted model when higher-quality results are needed.
-
-In short:
-
-- use `Ollama` for local debugging, development, and fast iteration
-- use `OpenRouter` when you want access to stronger hosted models
-
 ## Example conversation
 
 Below is a shortened example of how the demo application can interact with a user. This example was captured with full access selected at startup by entering `0` as the user id.
 
 ```text
-System:
+Application:
 Enter user id or /exit: 0
 No user was selected. The app will show all available data.
 ```
@@ -206,7 +323,7 @@ What can you do?
 ```
 
 ```text
-LLM:
+Assistant:
 I can help you write and run read-only SQL queries against the HarborFlow database.
 For example:
 1) List recently created sales orders (by OrderDate)
@@ -223,7 +340,7 @@ Show me all active branches
 ```
 
 ```text
-LLM:
+Application result:
 ```
 
 | BranchId | BranchCode | BranchName | Region | City | IsActive | CreatedUtc |
@@ -233,8 +350,12 @@ LLM:
 | 1 | TOR | Toronto Branch | Ontario | Toronto | True | 29.03.2026 20:56:39 |
 
 ```text
-LLM:
+Application:
 Rows: 3
+```
+
+```text
+Assistant:
 Active branches found: Calgary Branch (Alberta, Calgary), Ottawa Branch (Ontario, Ottawa), and Toronto Branch (Ontario, Toronto). Want results limited to a specific region or city?
 ```
 
@@ -244,7 +365,7 @@ How many people work in the branches?
 ```
 
 ```text
-LLM:
+Application result:
 ```
 
 | TotalEmployees |
@@ -252,8 +373,12 @@ LLM:
 | 13 |
 
 ```text
-LLM:
+Application:
 Rows: 1
+```
+
+```text
+Assistant:
 There are 13 employees working in branches (employees with a non-null BranchId).
 ```
 
@@ -263,7 +388,7 @@ Show 5 recent sales orders
 ```
 
 ```text
-LLM:
+Application result:
 ```
 
 | SalesOrderId | OrderNumber | OrderDate | OrderStatus | CurrencyCode | Notes |
@@ -275,8 +400,12 @@ LLM:
 | 36 | SO-2026-0036 | 08.03.2026 0:00:00 | Closed | CAD | Late quarter accessories |
 
 ```text
-LLM:
+Application:
 Rows: 5
+```
+
+```text
+Assistant:
 Recent 5 sales orders (newest first): SO-2026-0040 (Approved, CAD, 2026-03-12), SO-2026-0039 (Submitted, CAD, 2026-03-11), SO-2026-0038 (Draft, CAD, 2026-03-10), SO-2026-0037 (Closed, CAD, 2026-03-09), SO-2026-0036 (Closed, CAD, 2026-03-08). Which date/status range should I pull next?
 ```
 
@@ -286,17 +415,17 @@ Recent 5 sales orders (newest first): SO-2026-0040 (Approved, CAD, 2026-03-12), 
   Creates and seeds the HarborFlow demo database.
 - [Program.cs](./SqDbAiAgent.Console/Program.cs)  
   Application startup and provider wiring.
-- [DbChatSession.cs](./SqDbAiAgent.Console/Services/DbChatSession.cs)  
-  Custom main agent loop.
-- [AgentFrameworkDbChatSession.cs](./SqDbAiAgent.Console/Services/AgentFrameworkDbChatSession.cs)
-  Microsoft Agent Framework main agent and tool orchestration.
-- [AgentFrameworkChatClientFactory.cs](./SqDbAiAgent.Console/Services/AgentFrameworkChatClientFactory.cs)
-  Framework-side OpenRouter and Ollama adapters, independent of the custom provider clients.
-- [ValidatedSqlExecutor.cs](./SqDbAiAgent.Console/Services/ValidatedSqlExecutor.cs)
+- [DbChatSession.cs](./SqDbAiAgent.Console/Services/Chat/DbChatSession.cs)
+  Main agent loop.
+- [ValidatedSqlExecutor.cs](./SqDbAiAgent.Console/Services/Sql/ValidatedSqlExecutor.cs)
   Shared SQL approval, security rewriting, execution, runtime repair, and rendering boundary.
-- [SqlApprovalSession.cs](./SqDbAiAgent.Console/Services/SqlApprovalSession.cs)  
+- [SqlApprovalSession.cs](./SqDbAiAgent.Console/Services/Sql/SqlApprovalSession.cs)
   SQL approval and repair loop.
-- [MessageAnalyzeSession.cs](./SqDbAiAgent.Console/Services/MessageAnalyzeSession.cs)  
+- [MessageAnalyzeSession.cs](./SqDbAiAgent.Console/Services/Chat/MessageAnalyzeSession.cs)
   LLM-based message classification and topic detection.
 - [HarborFlowSecurityFilter.cs](./SqDbAiAgent.Console/SecurityFilters/HarborFlow/HarborFlowSecurityFilter.cs)  
   HarborFlow-specific row-security logic.
+- [McpServerHost.cs](./SqDbAiAgent.Console/Services/Mcp/McpServerHost.cs)
+  Shared HTTP and stdio MCP hosting, authentication, transport selection, and conditional tool registration.
+- [McpAgentInstructionsProviderService.cs](./SqDbAiAgent.Console/Services/Mcp/McpAgentInstructionsProviderService.cs)
+  Shared automatic MCP instructions and named `database_agent` prompt content.
