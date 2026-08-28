@@ -3,12 +3,13 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
 
 namespace SqDbAiAgent.ConsoleApp.Services.Llm;
 
 public sealed class OpenRouterClientService(
     HttpClient httpClient,
-    LlmInteractionLoggerService interactionLogger,
+    ILogger<OpenRouterClientService> logger,
     IOptions<OpenRouterOptions> options) : ILlmClient
 {
     private readonly OpenRouterOptions _options = options.Value;
@@ -83,16 +84,11 @@ public sealed class OpenRouterClientService(
             ToolChoice = tools is { Count: > 0 } ? "auto" : null
         };
 
-        if (interactionLogger.IsEnabled)
+        if (logger.IsEnabled(LogLevel.Debug))
         {
-            var requestJson = JsonSerializer.Serialize(request, JsonSerializerOptions);
-            await interactionLogger.LogAsync(
-                $$"""
-                ===== OPENROUTER REQUEST {{DateTime.UtcNow:O}} =====
-                POST chat/completions
-                {{requestJson}}
-                """,
-                cancellationToken);
+            logger.LogDebugEvent("LlmRequest",
+                ("provider", "OpenRouter"), ("model", model), ("endpoint", "chat/completions"),
+                ("request", request));
         }
 
         using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "chat/completions")
@@ -104,14 +100,10 @@ public sealed class OpenRouterClientService(
         using var response = await httpClient.SendAsync(httpRequest, cancellationToken);
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
 
-        if (interactionLogger.IsEnabled)
+        if (logger.IsEnabled(LogLevel.Debug))
         {
-            await interactionLogger.LogAsync(
-                $$"""
-                ===== OPENROUTER RESPONSE {{DateTime.UtcNow:O}} =====
-                {{responseJson}}
-                """,
-                cancellationToken);
+            logger.LogDebugEvent("LlmResponse",
+                ("provider", "OpenRouter"), ("model", model), ("response", ParseJsonOrRaw(responseJson)));
         }
 
         if (!response.IsSuccessStatusCode)
@@ -412,6 +404,12 @@ public sealed class OpenRouterClientService(
     };
 
     private static readonly JsonElement EmptyObject = JsonDocument.Parse("{}").RootElement.Clone();
+
+    private static object ParseJsonOrRaw(string json)
+    {
+        try { return JsonDocument.Parse(json).RootElement.Clone(); }
+        catch (JsonException) { return json; }
+    }
 
     private static string GetErrorMessage(string responseJson)
     {

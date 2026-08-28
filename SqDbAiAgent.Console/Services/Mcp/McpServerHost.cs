@@ -20,10 +20,8 @@ public static class McpServerHost
         ConfigureFiles(builder.Configuration, args);
         var configuredHttp = builder.Configuration.GetSection(McpHttpOptions.SectionName)
             .Get<McpHttpOptions>() ?? new McpHttpOptions();
-        if (!configuredHttp.ConsoleOutputEnabled)
-        {
-            builder.Logging.ClearProviders();
-        }
+        builder.Logging.ClearProviders();
+        builder.Logging.AddJsonlFile(builder.Configuration, "McpHttp");
 
         builder.Services.AddOptions<McpHttpOptions>()
             .Bind(builder.Configuration.GetSection(McpHttpOptions.SectionName))
@@ -31,12 +29,6 @@ public static class McpServerHost
             .Validate(options => Uri.TryCreate(options.Url, UriKind.Absolute, out _), "McpHttp Url must be a valid absolute URI.")
             .Validate(options => IsUsableApiKey(options.ApiKey), "McpHttp ApiKey must be configured and must not use the sample placeholder.")
             .ValidateOnStart();
-        if (!IsUsableApiKey(configuredHttp.ApiKey))
-        {
-            WriteHttp(configuredHttp, "HTTP MCP startup refused: configure a non-placeholder McpHttp:ApiKey or McpHttp__ApiKey.", true);
-            return 1;
-        }
-
         builder.WebHost.UseUrls(configuredHttp.Url);
         var databaseName = GetConfiguredDatabaseName(builder.Configuration);
         var hasSecurityProfile = new SecurityFilterFactoryService().HasSecurityProfile(databaseName);
@@ -53,6 +45,13 @@ public static class McpServerHost
         }
 
         await using var app = builder.Build();
+        var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("SqDbAiAgent.McpHttp");
+        if (!IsUsableApiKey(configuredHttp.ApiKey))
+        {
+            if (logger.IsEnabled(LogLevel.Warning))
+                logger.LogWarningEvent("McpStartupRefused", ("reason", "A non-placeholder API key is required."));
+            return 1;
+        }
         app.Use(async (httpContext, next) =>
         {
             if (!httpContext.Request.Path.StartsWithSegments("/mcp"))
@@ -80,7 +79,9 @@ public static class McpServerHost
         try
         {
             await app.Services.GetRequiredService<DatabaseContextService>().GetAsync(cancellationToken);
-            WriteHttp(configuredHttp, $"HTTP MCP server ready at {configuredHttp.Url.TrimEnd('/')}/mcp.");
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformationEvent("McpServerStarted", ("transport", "Http"),
+                    ("url", configuredHttp.Url.TrimEnd('/') + "/mcp"));
             await app.RunAsync(cancellationToken);
             return 0;
         }
@@ -90,7 +91,8 @@ public static class McpServerHost
         }
         catch (Exception ex)
         {
-            WriteHttp(configuredHttp, $"HTTP MCP server failed: {ex.Message}", true);
+            if (logger.IsEnabled(LogLevel.Error))
+                logger.LogErrorEvent("McpServerFailed", ex, ("transport", "Http"));
             return 1;
         }
     }
@@ -100,6 +102,7 @@ public static class McpServerHost
         var builder = Host.CreateApplicationBuilder(args);
         ConfigureFiles(builder.Configuration, args);
         builder.Logging.ClearProviders();
+        builder.Logging.AddJsonlFile(builder.Configuration, "McpStdio");
         var databaseName = GetConfiguredDatabaseName(builder.Configuration);
         var hasSecurityProfile = new SecurityFilterFactoryService().HasSecurityProfile(databaseName);
         AddSharedServices(builder.Services, builder.Configuration, McpTransport.Stdio, databaseUserId, databaseName, hasSecurityProfile);
@@ -115,15 +118,22 @@ public static class McpServerHost
         }
 
         using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("SqDbAiAgent.McpStdio");
         try
         {
             var context = await host.Services.GetRequiredService<DatabaseContextService>().GetAsync(cancellationToken);
             if (databaseUserId > 0 && !context.SecurityUsers.ContainsKey(databaseUserId))
             {
-                Console.Error.WriteLine("The configured database user ID was not returned by list_security_users.");
+                if (logger.IsEnabled(LogLevel.Warning))
+                    logger.LogWarningEvent("McpStartupRefused",
+                        ("reason", "The configured database user ID was not returned by list_security_users."),
+                        ("databaseUser", databaseUserId));
                 return 1;
             }
 
+            if (logger.IsEnabled(LogLevel.Information))
+                logger.LogInformationEvent("McpServerStarted", ("transport", "Stdio"),
+                    ("databaseUser", databaseUserId));
             await host.RunAsync(cancellationToken);
             return 0;
         }
@@ -133,7 +143,8 @@ public static class McpServerHost
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Stdio MCP server failed: {ex.Message}");
+            if (logger.IsEnabled(LogLevel.Error))
+                logger.LogErrorEvent("McpServerFailed", ex, ("transport", "Stdio"));
             return 1;
         }
     }
@@ -198,16 +209,6 @@ public static class McpServerHost
         }
 
         return builder.InitialCatalog;
-    }
-
-    private static void WriteHttp(McpHttpOptions options, string message, bool error = false)
-    {
-        if (!options.ConsoleOutputEnabled)
-        {
-            return;
-        }
-
-        if (error) Console.Error.WriteLine(message); else Console.WriteLine(message);
     }
 
     private static bool IsUsableApiKey(string? apiKey) =>

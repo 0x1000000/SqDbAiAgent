@@ -1,5 +1,6 @@
 using Microsoft.Data.SqlClient;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
 using SqExpress;
 using SqExpress.DataAccess;
 using SqExpress.DbMetadata;
@@ -16,7 +17,8 @@ public sealed class DbChatService(
     IOptions<OllamaOptions> ollamaOptions,
     IOptions<OpenRouterOptions> openRouterOptions,
     ToolCallingResolverService toolCallingResolver,
-    DatabaseContextService databaseContextService)
+    DatabaseContextService databaseContextService,
+    ILogger<ValidatedSqlExecutor> sqlLogger)
 {
     private readonly AppConfig _appConfig = appConfig.Value;
     private readonly OllamaOptions _ollamaOptions = ollamaOptions.Value;
@@ -104,7 +106,8 @@ public sealed class DbChatService(
             sqlApprovalSession,
             userId,
             connectionString,
-            DatabaseContextService.CreateDatabase);
+            DatabaseContextService.CreateDatabase,
+            sqlLogger);
 
         var toolCalling = await toolCallingResolver.ResolveAsync(appConfig.ToolCalling, model, cancellationToken);
 

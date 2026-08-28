@@ -67,9 +67,6 @@ The complete configuration, shown with comments, is:
     // Interactive LLM provider: Ollama or OpenRouter. MCP mode does not use it.
     "LlmProvider": "Ollama",
 
-    // Optional file for raw LLM request and response logging; empty disables it.
-    "LlmLogFilePath": "",
-
     // Maximum agent-loop steps for one user request.
     "MaxAgentSteps": 5,
 
@@ -125,17 +122,25 @@ The complete configuration, shown with comments, is:
     "PromptSafetyChars": 1500
   },
 
+  "Logging": {
+    "File": {
+      // Empty or omitted disables file logging. Relative paths use the application directory.
+      "Path": "",
+      // PlainText (default) or Jsonl.
+      "Format": "PlainText",
+      // Warning is the default. Debug includes prompts, MCP arguments/results, SQL, and returned rows.
+      "MinimumLevel": "Warning",
+      // Daily JSONL files older than this are removed. Only files matching Path are considered.
+      "RetainedDays": 7
+    }
+  },
   "McpHttp": {
     // Streamable HTTP listener; the MCP endpoint is /mcp.
     "Url": "http://localhost:5080",
 
     // Bearer token required by every HTTP MCP request. Replace this placeholder,
     // preferably through the McpHttp__ApiKey environment variable.
-    "ApiKey": "CHANGE_ME",
-
-    // Enables non-sensitive operational output in HTTP mode. Stdio mode always
-    // keeps stdout exclusively for MCP protocol traffic.
-    "ConsoleOutputEnabled": false
+    "ApiKey": "CHANGE_ME"
   },
 
   "Ollama": {
@@ -206,8 +211,7 @@ Configure a non-placeholder API key:
 {
   "McpHttp": {
     "Url": "http://localhost:5080",
-    "ApiKey": "replace-with-a-long-random-secret",
-    "ConsoleOutputEnabled": false
+    "ApiKey": "replace-with-a-long-random-secret"
   }
 }
 ```
@@ -218,7 +222,7 @@ Start the server with:
 SqDbAiAgent.ConsoleApp.exe --transport http
 ```
 
-Prefer the `McpHttp__ApiKey` environment variable for the secret. The stateless streamable HTTP endpoint is `/mcp`, and every request requires `Authorization: Bearer <key>` using fixed-time key comparison. Operational console output is disabled unless `McpHttp:ConsoleOutputEnabled` is `true`.
+Prefer the `McpHttp__ApiKey` environment variable for the secret. The stateless streamable HTTP endpoint is `/mcp`, and every request requires `Authorization: Bearer <key>` using fixed-time key comparison. MCP modes write no operational console output; configure file logging for diagnostics.
 
 When a selectable-user security profile is available, the HTTP client supplies the selected identity through `X-Database-User-Id`. When no such profile exists, the security-user tool and its related instructions are not exposed.
 

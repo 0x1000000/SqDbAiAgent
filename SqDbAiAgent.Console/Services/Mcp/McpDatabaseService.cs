@@ -1,4 +1,6 @@
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace SqDbAiAgent.ConsoleApp.Services.Mcp;
 
@@ -6,17 +8,31 @@ public sealed class McpDatabaseService(
     DatabaseContextService databaseContextService,
     IOptions<AppConfig> appConfig,
     TableResultFormatterService tableResultFormatter,
-    McpRuntimeContextService runtimeContext)
+    McpRuntimeContextService runtimeContext,
+    ILogger<ValidatedSqlExecutor>? sqlLogger = null,
+    ILogger<McpDatabaseService>? logger = null)
 {
+    private readonly ILogger<ValidatedSqlExecutor> _sqlLogger = sqlLogger ?? NullLogger<ValidatedSqlExecutor>.Instance;
+    private readonly ILogger<McpDatabaseService> _logger = logger ?? NullLogger<McpDatabaseService>.Instance;
     public const string UserHeaderName = McpContractNames.DatabaseUserHeader;
 
     public async Task<IReadOnlyList<McpSecurityUser>> ListSecurityUsersAsync(
         CancellationToken cancellationToken = default)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (this._logger.IsEnabled(LogLevel.Debug))
+            this._logger.LogDebugEvent("McpToolCall", ("tool", McpContractNames.ListSecurityUsersTool));
         var context = await databaseContextService.GetAsync(cancellationToken);
-        return context.SecurityUsers
+        var users = context.SecurityUsers
             .Select(user => new McpSecurityUser(user.Key, user.Value))
             .ToArray();
+        if (this._logger.IsEnabled(LogLevel.Information))
+            this._logger.LogInformationEvent("McpToolCompleted", ("tool", McpContractNames.ListSecurityUsersTool),
+                ("success", true), ("durationMs", System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds),
+                ("rowCount", users.Length));
+        if (this._logger.IsEnabled(LogLevel.Debug))
+            this._logger.LogDebugEvent("McpToolResult", ("tool", McpContractNames.ListSecurityUsersTool), ("result", users));
+        return users;
     }
 
     public async Task<McpQueryResponse> SubmitAsync(
@@ -24,6 +40,10 @@ public sealed class McpDatabaseService(
         string sql,
         CancellationToken cancellationToken = default)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (this._logger.IsEnabled(LogLevel.Debug))
+            this._logger.LogDebugEvent("McpToolCall", ("tool", McpContractNames.SubmitSqlTool),
+                ("userRequest", userRequest), ("sql", sql), ("databaseUser", runtimeContext.GetSecurityUserValue()));
         var context = await databaseContextService.GetAsync(cancellationToken);
         var securityUser = ResolveSecurityUser(
             runtimeContext.GetSecurityUserValue(),
@@ -36,9 +56,11 @@ public sealed class McpDatabaseService(
 
         var executor = CreateExecutor(context, securityUser.UserId);
         var result = await executor.SubmitForAgentAsync(userRequest, sql, cancellationToken);
-        return result is null
+        var response = result is null
             ? McpQueryResponse.Failed(executor.LastFailure ?? "SQL validation or execution failed.")
             : BuildResponse(result);
+        LogMcpResult(McpContractNames.SubmitSqlTool, response, started);
+        return response;
     }
 
     public async Task<McpQueryResponse> InvestigateAsync(
@@ -47,6 +69,11 @@ public sealed class McpDatabaseService(
         string sql,
         CancellationToken cancellationToken = default)
     {
+        var started = System.Diagnostics.Stopwatch.GetTimestamp();
+        if (this._logger.IsEnabled(LogLevel.Debug))
+            this._logger.LogDebugEvent("McpToolCall", ("tool", McpContractNames.InvestigateSqlTool),
+                ("userRequest", userRequest), ("purpose", purpose), ("sql", sql),
+                ("databaseUser", runtimeContext.GetSecurityUserValue()));
         var context = await databaseContextService.GetAsync(cancellationToken);
         var securityUser = ResolveSecurityUser(
             runtimeContext.GetSecurityUserValue(),
@@ -59,10 +86,12 @@ public sealed class McpDatabaseService(
 
         var executor = CreateExecutor(context, securityUser.UserId);
         var result = await executor.InvestigateAsync(userRequest, purpose, sql, cancellationToken);
-        return result is null
+        var response = result is null
             ? McpQueryResponse.Failed(
                 executor.LastInvestigationFailure ?? "Investigation validation or execution failed.")
             : BuildResponse(result);
+        LogMcpResult(McpContractNames.InvestigateSqlTool, response, started);
+        return response;
     }
 
     private ValidatedSqlExecutor CreateExecutor(DatabaseContext context, int? userId)
@@ -71,14 +100,25 @@ public sealed class McpDatabaseService(
             context.PublicTables,
             appConfig.Value.DefaultQueryRowLimit);
         return new ValidatedSqlExecutor(
-            new ConsoleOutputService(),
+            new NullConsoleOutputService(),
             appConfig.Value,
             context.SecurityFilter,
             tableResultFormatter,
             new DeterministicSqlApprovalSession(validator),
             userId,
             context.ConnectionString,
-            DatabaseContextService.CreateDatabase);
+            DatabaseContextService.CreateDatabase,
+            this._sqlLogger);
+    }
+
+    private void LogMcpResult(string tool, McpQueryResponse response, long started)
+    {
+        if (this._logger.IsEnabled(LogLevel.Information))
+            this._logger.LogInformationEvent("McpToolCompleted", ("tool", tool), ("success", response.Success),
+                ("durationMs", System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds),
+                ("rowCount", response.TotalRows), ("truncated", response.Truncated));
+        if (this._logger.IsEnabled(LogLevel.Debug))
+            this._logger.LogDebugEvent("McpToolResult", ("tool", tool), ("result", response));
     }
 
     internal static SecurityUserResolution ResolveSecurityUser(

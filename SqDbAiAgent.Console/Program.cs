@@ -35,7 +35,8 @@ public static class Program
             .AddJsonFile("appsettings.Development.json", optional: true, reloadOnChange: false)
             .AddEnvironmentVariables();
 
-        builder.Logging.SetMinimumLevel(LogLevel.Warning);
+        builder.Logging.ClearProviders();
+        builder.Logging.AddJsonlFile(builder.Configuration, "Interactive");
 
         builder.Services
             .AddOptions<AppConfig>()
@@ -90,7 +91,6 @@ public static class Program
         builder.Services.AddSingleton<ToolCallingResolverService>();
 
         builder.Services.AddSingleton<IConsoleOutput, ConsoleOutputService>();
-        builder.Services.AddSingleton<LlmInteractionLoggerService>();
         builder.Services.AddSingleton<TableResultFormatterService>();
         builder.Services.AddSingleton<MessageAnalyzeService>();
         builder.Services.AddSingleton<SqlApprovalService>();
@@ -99,6 +99,7 @@ public static class Program
         builder.Services.AddSingleton<DatabaseContextService>();
 
         using var host = builder.Build();
+        var appLogger = host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("SqDbAiAgent.Program");
 
         try
         {
@@ -108,12 +109,12 @@ public static class Program
             var openRouterOptions = host.Services.GetRequiredService<IOptions<OpenRouterOptions>>().Value;
             var output = host.Services.GetRequiredService<IConsoleOutput>();
             var chatService = host.Services.GetRequiredService<DbChatService>();
-            var interactionLogger = host.Services.GetRequiredService<LlmInteractionLoggerService>();
             var providerName = appConfig.LlmProvider;
             var baseUrl = IsOpenRouter(providerName) ? openRouterOptions.BaseUrl : ollamaOptions.BaseUrl;
             var configuredModel = IsOpenRouter(providerName) ? openRouterOptions.Model : ollamaOptions.Model;
-
-            await interactionLogger.ResetAsync();
+            if (appLogger.IsEnabled(LogLevel.Information))
+                appLogger.LogInformationEvent("ApplicationStarted", ("provider", providerName),
+                    ("model", configuredModel));
 
             output.OutDebugLine($"Checking {providerName} at {baseUrl}...");
 
@@ -167,10 +168,15 @@ public static class Program
 
             await chatService.RunAsync(output);
 
+            if (appLogger.IsEnabled(LogLevel.Information))
+                appLogger.LogInformationEvent("ApplicationStopped", ("success", true));
+
             return 0;
         }
         catch (Exception ex)
         {
+            if (appLogger.IsEnabled(LogLevel.Error))
+                appLogger.LogErrorEvent("ApplicationFailed", ex);
             var friendlyMessage = TryBuildFriendlyStartupMessage(ex);
             Console.Error.WriteLine(friendlyMessage ?? $"Application failed: {ex.Message}");
             return 1;

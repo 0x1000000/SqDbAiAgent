@@ -13,8 +13,6 @@ public sealed class AppConfig
     [Required]
     public string LlmProvider { get; init; } = "Ollama";
 
-    public string LlmLogFilePath { get; init; } = @"C:\Temp\ollama.log";
-
     // Maximum number of agent decision steps for a single user request before the loop is stopped.
     [Range(1, 100)]
     public int MaxAgentSteps { get; init; } = 5;

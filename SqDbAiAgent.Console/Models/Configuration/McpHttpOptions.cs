@@ -12,5 +12,4 @@ public sealed class McpHttpOptions
 
     public string ApiKey { get; init; } = ApiKeyPlaceholder;
 
-    public bool ConsoleOutputEnabled { get; init; }
 }

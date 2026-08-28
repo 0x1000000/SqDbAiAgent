@@ -2,6 +2,7 @@ using System.Data;
 using System.Diagnostics.CodeAnalysis;
 using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
+using Microsoft.Extensions.Logging;
 using SqExpress;
 using SqExpress.DataAccess;
 using SqExpress.SqlExport;
@@ -16,7 +17,8 @@ public sealed class ValidatedSqlExecutor(
     ISqlApprovalSession sqlApprovalSession,
     int? userId,
     string connectionString,
-    Func<string, ISqDatabase> dbFactory)
+    Func<string, ISqDatabase> dbFactory,
+    ILogger<ValidatedSqlExecutor> logger)
 {
     public string? LastInvestigationFailure { get; private set; }
     public string? LastFailure { get; private set; }
@@ -97,9 +99,15 @@ public sealed class ValidatedSqlExecutor(
         int? materializedRowLimit,
         CancellationToken cancellationToken)
     {
+        if (logger.IsEnabled(LogLevel.Debug))
+            logger.LogDebugEvent("SqlProposed",
+                ("sql", sql), ("userRequest", userRequest), ("investigationPurpose", investigationPurpose));
         var approval = await sqlApprovalSession.ApproveAsync(userRequest, sql, cancellationToken: cancellationToken);
         if (!approval.Success)
         {
+            if (logger.IsEnabled(LogLevel.Warning))
+                logger.LogWarningEvent("SqlRejected",
+                    ("reason", approval.FailureMessage), ("investigation", investigationPurpose is not null));
             this.WriteFailure(approval.FailureMessage, investigationPurpose);
             return null;
         }
@@ -175,18 +183,34 @@ public sealed class ValidatedSqlExecutor(
 
             query = (IExprQuery)safeQuery;
             WriteAcceptedQuery(currentApproval.ApprovedSql, query);
+            var executedSql = query.ToSql(TSqlExporter.Default);
+            if (logger.IsEnabled(LogLevel.Debug))
+                logger.LogDebugEvent("SqlApproved",
+                    ("approvedSql", currentApproval.ApprovedSql), ("executedSql", executedSql),
+                    ("attempt", attempt), ("investigationPurpose", investigationPurpose));
 
             try
             {
+                var started = System.Diagnostics.Stopwatch.GetTimestamp();
                 var result = await this.ExecuteQueryAsync(
                     query,
                     materializedRowLimit,
                     cancellationToken);
+                var rendered = tableResultFormatter.RenderMarkdown(result, visibleCellLimit);
+                if (logger.IsEnabled(LogLevel.Information))
+                    logger.LogInformationEvent("SqlExecuted",
+                        ("durationMs", System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds),
+                        ("rowCount", result.Rows.Count), ("columnCount", result.Columns.Count),
+                        ("truncated", rendered.Truncated), ("success", true));
+                if (logger.IsEnabled(LogLevel.Debug))
+                    logger.LogDebugEvent("SqlResult",
+                        ("executedSql", executedSql), ("rows", ToRows(result)),
+                        ("rowCount", result.Rows.Count), ("truncated", rendered.Truncated));
                 return new ValidatedSqlExecutionResult(
                     currentApproval.ApprovedSql,
                     result,
-                    tableResultFormatter.RenderMarkdown(result, visibleCellLimit),
-                    query.ToSql(TSqlExporter.Default));
+                    rendered,
+                    executedSql);
             }
             catch (Exception ex)
             {
@@ -197,6 +221,9 @@ public sealed class ValidatedSqlExecutor(
                 }
 
                 output.OutDebugLine($"SQL runtime failed on attempt {attempt}: {sqlException.Message}");
+                if (logger.IsEnabled(LogLevel.Warning))
+                    logger.LogWarningEvent("SqlExecutionFailed",
+                        ("attempt", attempt), ("reason", sqlException.Message));
                 output.OutDebugLine("Wrong T-SQL:");
                 output.OutDebugLine(currentApproval.ApprovedSql);
                 output.OutDebugLine(string.Empty);
@@ -311,6 +338,9 @@ public sealed class ValidatedSqlExecutor(
 
     private void WriteFailure(string message, string? investigationPurpose)
     {
+        if (logger.IsEnabled(LogLevel.Warning))
+            logger.LogWarningEvent("SqlRejected", ("reason", message),
+                ("investigation", investigationPurpose is not null), ("investigationPurpose", investigationPurpose));
         if (investigationPurpose is null)
         {
             this.LastFailure = message;
@@ -321,6 +351,22 @@ public sealed class ValidatedSqlExecutor(
         output.OutDebugLine($"Investigation failed: {message}");
         output.OutDebugLine(string.Empty);
         this.LastInvestigationFailure = message;
+    }
+
+    private static IReadOnlyList<IReadOnlyDictionary<string, object?>> ToRows(DataTable table)
+    {
+        var rows = new List<IReadOnlyDictionary<string, object?>>(table.Rows.Count);
+        foreach (DataRow dataRow in table.Rows)
+        {
+            var row = new Dictionary<string, object?>(table.Columns.Count, StringComparer.Ordinal);
+            foreach (DataColumn column in table.Columns)
+            {
+                var value = dataRow[column];
+                row[column.ColumnName] = value is DBNull ? null : value;
+            }
+            rows.Add(row);
+        }
+        return rows;
     }
 
     internal static bool ValidateInvestigationSql(string sql, int maximumRows, out string error)

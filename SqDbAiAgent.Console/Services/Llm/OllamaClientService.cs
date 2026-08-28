@@ -1,10 +1,11 @@
 using System.Net.Http.Json;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
 
 namespace SqDbAiAgent.ConsoleApp.Services.Llm;
 
-public sealed class OllamaClientService(HttpClient httpClient, LlmInteractionLoggerService interactionLogger) : ILlmClient
+public sealed class OllamaClientService(HttpClient httpClient, ILogger<OllamaClientService> logger) : ILlmClient
 {
     public async Task<LlmModelCapabilities> GetModelCapabilitiesAsync(
         string model,
@@ -66,30 +67,21 @@ public sealed class OllamaClientService(HttpClient httpClient, LlmInteractionLog
                 .ToList(),
             Tools = tools?.Select(ToToolDto).ToList()
         };
-        if (interactionLogger.IsEnabled)
+        if (logger.IsEnabled(LogLevel.Debug))
         {
-            var requestJson = JsonSerializer.Serialize(request, JsonSerializerOptions);
-            await interactionLogger.LogAsync(
-                $$"""
-                ===== OLLAMA REQUEST {{DateTime.UtcNow:O}} =====
-                POST /api/chat
-                {{requestJson}}
-                """,
-                cancellationToken);
+            logger.LogDebugEvent("LlmRequest",
+                ("provider", "Ollama"), ("model", model), ("endpoint", "/api/chat"),
+                ("request", request));
         }
 
         using var response = await httpClient.PostAsJsonAsync("/api/chat", request, cancellationToken);
         response.EnsureSuccessStatusCode();
 
         var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
-        if (interactionLogger.IsEnabled)
+        if (logger.IsEnabled(LogLevel.Debug))
         {
-            await interactionLogger.LogAsync(
-                $$"""
-                ===== OLLAMA RESPONSE {{DateTime.UtcNow:O}} =====
-                {{responseJson}}
-                """,
-                cancellationToken);
+            logger.LogDebugEvent("LlmResponse",
+                ("provider", "Ollama"), ("model", model), ("response", ParseJson(responseJson)));
         }
 
         var payload = JsonSerializer.Deserialize<OllamaChatResponse>(responseJson, JsonSerializerOptions);
@@ -250,6 +242,8 @@ public sealed class OllamaClientService(HttpClient httpClient, LlmInteractionLog
     };
 
     private static readonly JsonElement EmptyObject = JsonDocument.Parse("{}").RootElement.Clone();
+
+    private static JsonElement ParseJson(string json) => JsonDocument.Parse(json).RootElement.Clone();
 
     private static object? ToWireThinkValue(LlmThinkLevel thinkLevel)
     {
