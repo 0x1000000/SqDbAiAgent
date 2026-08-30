@@ -2,9 +2,48 @@
 
 This repository demonstrates how an AI assistant can answer questions about a SQL Server database without giving generated SQL unrestricted access to it. Users ask questions in ordinary language; the application gives the agent a controlled description of the exposed schema and lets it propose read-only queries when data is needed.
 
-Generated SQL is treated as an untrusted proposal. [SqExpress](https://github.com/0x1000000/SqExpress) parses it into an expression tree, checks it against the exposed tables and columns, rejects unsupported or unsafe operations, and adds a default row limit when the query has no explicit outer limit. The application can then apply a database-specific security policy before executing the resulting query and returning a bounded, user-oriented answer. Narrow investigation queries use the same path when the agent needs to resolve a concrete uncertainty before producing its final response.
+The project is guided by four goals:
 
-The same protected database capabilities are available in two forms: a built-in interactive chat and an MCP server for external AI clients. Interactive chat performs the conversation and tool orchestration itself. MCP mode exposes the schema and query tools over HTTP or standard input/output while leaving orchestration to the connected client; it does not initialize an LLM of its own.
+- **Protection against AI hallucinations.** Treat generated SQL as untrusted input and prevent mistaken or destructive statements, such as `DROP DATABASE`, from reaching the database execution path.
+- **Object-level permissions.** Control which schemas, tables, and columns the agent may discover and query.
+- **Row-level permissions.** Restrict which records a particular user may see, even within an otherwise permitted table.
+- **Controlled update operations.** Support narrowly defined data changes for which the application - not the model - determines the available mutations, validates their inputs and scope, and applies any required authorization or confirmation.
+
+The current demo applies the first three goals to read-only queries. Generated SQL is treated as an untrusted proposal. [SqExpress](https://github.com/0x1000000/SqExpress) parses it into an expression tree, checks it against the exposed tables and columns, rejects unsupported or unsafe operations, and adds a default row limit when the query has no explicit outer limit. The application can then apply a database-specific row-level security policy before executing the resulting query and returning a bounded, user-oriented answer. These safeguards are enforced in application code rather than delegated to prompt instructions. Narrow investigation queries use the same protected path when the agent needs to resolve a concrete uncertainty before producing its final response.
+
+These protected database capabilities are available through the two integration modes shown below. In both modes, proposed SQL passes through the same SqExpress validation and security pipeline before it can reach SQL Server, and only bounded results are returned.
+
+**Built-in interactive chat**
+
+In this mode, SqDbAiAgent owns the user conversation and tool orchestration. It communicates with the configured LLM, validates the SQL proposed during that exchange, executes approved queries, and incorporates the results into the response shown to the user.
+
+```mermaid
+flowchart LR
+    User[User] <--> Chat[SqDbAiAgent interactive chat]
+    Chat <--> LLM[LLM API]
+    Chat --> Pipeline[SqExpress validation and security policy]
+    Pipeline --> Database[(SQL Server)]
+    Database -->|Bounded results| Chat
+    classDef sqDbAiAgent fill:#0969da,color:#ffffff,stroke:#0550ae,stroke-width:3px
+    class Chat sqDbAiAgent
+```
+
+**MCP mode**
+
+In this mode, the external app chat and its agent API own the conversation and orchestration. The agent calls the SqDbAiAgent MCP server over HTTP or standard input/output to inspect the exposed schema and submit queries. The MCP server provides the protected database tools and does not initialize an LLM of its own.
+
+```mermaid
+flowchart LR
+    User[User] <--> App[App chat]
+    App <--> Agent[Agent API]
+    Agent -->|MCP tool call| MCP[SqDbAiAgent MCP server]
+    MCP --> Pipeline[SqExpress validation and security policy]
+    Pipeline --> Database[(SQL Server)]
+    Database -->|Bounded results| MCP
+    MCP -->|Tool result| Agent
+    classDef sqDbAiAgent fill:#0969da,color:#ffffff,stroke:#0550ae,stroke-width:3px
+    class MCP sqDbAiAgent
+```
 
 ## Contents
 
@@ -58,7 +97,7 @@ For local development overrides, you can also use `SqDbAiAgent.Console/appsettin
 
 The complete configuration, shown with comments, is:
 
-```jsonc
+```json
 {
   "App": {
     // SQL Server connection used for schema discovery and query execution.
